@@ -172,12 +172,11 @@ def test_forbidden_remediation_names_audio_group_for_audio(
 def test_check_access_unrecognized_oserror_reports_forbidden_not_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An errno this module doesn't specifically know (e.g. ENODEV, for hardware
-    that vanished mid-race) must never be silently reported as OK."""
+    """An errno this module doesn't specifically know must never be silently OK."""
     monkeypatch.setattr(
         access.os,
         "open",
-        lambda path, flags: (_ for _ in ()).throw(OSError(errno.ENODEV, "No such device")),
+        lambda path, flags: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")),
     )
 
     report = check_access("/dev/video0", "video")
@@ -185,6 +184,36 @@ def test_check_access_unrecognized_oserror_reports_forbidden_not_ok(
     assert report.state is AccessState.FORBIDDEN
     assert report.remediation
     assert access_error(report).code == EXIT_ENV_ERROR
+
+
+@pytest.mark.parametrize("code", [errno.ENODEV, errno.ENXIO])
+@pytest.mark.parametrize("kind", ["video", "audio"])
+def test_vanished_hardware_reports_absent_not_forbidden(
+    monkeypatch: pytest.MonkeyPatch, code: int, kind: str
+) -> None:
+    """A node whose hardware vanished is ABSENT, not FORBIDDEN.
+
+    ENODEV/ENXIO mean the node exists but there is no device behind it — the
+    camera was unplugged between enumeration and open. Reporting that as
+    FORBIDDEN hands the caller permission remediation (seat ACL, group
+    membership) for a problem that is not a permission problem at all, which
+    is the same dead end the absent/forbidden split exists to prevent.
+    """
+    monkeypatch.setattr(
+        access.os,
+        "open",
+        lambda path, flags: (_ for _ in ()).throw(OSError(code, "gone")),
+    )
+
+    report = check_access("/dev/video0", kind)
+
+    assert report.state is AccessState.ABSENT
+    assert access_error(report).code == EXIT_USER_ERROR
+    lowered = report.remediation.lower()
+    assert "permission" not in lowered
+    assert "seat" not in lowered
+    assert "group" not in lowered
+    assert "replug" in lowered or "unplug" in lowered
 
 
 def test_absent_and_forbidden_are_never_conflated(monkeypatch: pytest.MonkeyPatch) -> None:

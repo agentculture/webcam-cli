@@ -117,6 +117,16 @@ def _absent_remediation(kind: str, path: str) -> str:
     )
 
 
+def _vanished_remediation(kind: str, path: str) -> str:
+    subsystem = "microphone/card" if kind == "audio" else "camera"
+    listing = "'arecord -l'" if kind == "audio" else "/dev/v4l/by-id/"
+    return (
+        f"{path} exists but has no device behind it — the {subsystem} was unplugged "
+        f"after the node was enumerated; re-enumerate against {listing} and use the "
+        "stable id, since node numbers change on replug"
+    )
+
+
 def _forbidden_remediation(kind: str, path: str) -> str:
     if kind == "audio":
         return (
@@ -189,8 +199,19 @@ def check_access(path: str, kind: str) -> AccessReport:
                 remediation=_busy_remediation(kind, holder),
                 holder=holder,
             )
-        # Any other OSError (ENODEV/ENXIO for a node whose hardware vanished
-        # mid-race, etc.) is still an environment problem the caller cannot
+        if exc.errno in (errno.ENODEV, errno.ENXIO):
+            # The node exists but nothing is behind it: the device was
+            # unplugged between enumeration and open. That is an absent
+            # device, not a permission problem — reporting FORBIDDEN here
+            # would hand back seat-ACL/group remediation for a camera that
+            # is simply gone.
+            return AccessReport(
+                path=path,
+                kind=kind,
+                state=AccessState.ABSENT,
+                remediation=_vanished_remediation(kind, path),
+            )
+        # Any other OSError is still an environment problem the caller cannot
         # fix by blindly retrying — report it rather than silently claim OK.
         return AccessReport(
             path=path,
