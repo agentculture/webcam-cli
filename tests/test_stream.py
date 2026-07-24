@@ -313,16 +313,18 @@ def test_stream_overview_documents_the_hardware_split(emitted: list[object]) -> 
 
 def test_unknown_subverb_exits_1_not_2(capsys: pytest.CaptureFixture[str]) -> None:
     """parser_class=type(p) must propagate, or argparse exits 2 and bypasses hint:."""
+    parser = _parser()
     with pytest.raises(SystemExit) as exc:
-        _parser().parse_args(["stream", "bogus"])
+        parser.parse_args(["stream", "bogus"])
     assert exc.value.code == EXIT_USER_ERROR
     err = capsys.readouterr().err
     assert err.startswith("error:") and "hint:" in err
 
 
 def test_streams_are_unbounded_no_duration_flag_exists(emitted: list[object]) -> None:
+    parser = _parser()
     with pytest.raises(SystemExit):
-        _parser().parse_args(["stream", "video", "c270", "--duration", "5"])
+        parser.parse_args(["stream", "video", "c270", "--duration", "5"])
     assert _run(["stream", "video", "c270", "--json"]) == 0
     payload = emitted[-1]
     assert payload["bounded"] is False
@@ -846,10 +848,10 @@ def test_a_port_already_in_use_is_a_typed_error_naming_the_fix(
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     holder.bind(("127.0.0.1", 0))
     holder.listen(1)
-    port = holder.getsockname()[1]
+    port_arg = str(holder.getsockname()[1])
     try:
         with pytest.raises(CliError) as exc:
-            _run(["stream", "video", "c270", "--apply", "--port", str(port)])
+            _run(["stream", "video", "c270", "--apply", "--port", port_arg])
         assert exc.value.code == EXIT_ENV_ERROR
         assert "--port" in exc.value.remediation
     finally:
@@ -942,8 +944,9 @@ def test_warmup_ms_overrides_frames_and_is_mutually_exclusive(
     assert slept == [0.25]
     assert emitted[-1]["warmup"]["source"] == "--warmup-ms"
 
+    parser = _parser()
     with pytest.raises(SystemExit):
-        _parser().parse_args(
+        parser.parse_args(
             ["stream", "video", "c270", "--warmup-ms", "250", "--warmup-frames", "10"]
         )
 
@@ -1029,8 +1032,9 @@ def test_opus_audio_encoding_is_capability_gated(monkeypatch: pytest.MonkeyPatch
 
 
 def test_av_has_no_encode_flag() -> None:
+    parser = _parser()
     with pytest.raises(SystemExit):
-        _parser().parse_args(["stream", "av", "c270", "--encode", "vp8"])
+        parser.parse_args(["stream", "av", "c270", "--encode", "vp8"])
 
 
 # --- process plumbing -------------------------------------------------------

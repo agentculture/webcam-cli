@@ -120,6 +120,10 @@ SINK_ELEMENT = "tcpserversink"
 #: Container for every stream shape, so the wire format is self-describing.
 CONTAINER = "matroska"
 
+#: ``--json`` help text, shared by every sub-verb's parser so the string is
+#: defined once rather than repeated (python:S1192).
+_JSON_HELP = "Emit structured JSON."
+
 #: Video warm-up default, in frames. Measured on the reference host's C270 —
 #: see :data:`webcam_cli.engine.DEFAULT_WARMUP_FRAMES` for the runs, the
 #: numbers, and why the unit is frames rather than seconds. Shared with
@@ -1430,7 +1434,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         help="Stable device id (or a unique substring of one, or a /dev/v4l/by-id path). "
         "A bare /dev/videoN is refused: node numbering is plug-order, not identity.",
     )
-    parser.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    parser.add_argument("--json", action="store_true", help=_JSON_HELP)
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -1512,7 +1516,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         description="Expose a live attachment point another process can consume. "
         "Dry-run by default: nothing is opened until --apply.",
     )
-    p.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p.add_argument("--json", action="store_true", help=_JSON_HELP)
     p.set_defaults(func=_no_verb, json=False)
 
     # parser_class must propagate, or this noun's parse errors bypass the
@@ -1523,7 +1527,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         "overview",
         help="Describe the stream verb group (verbs, hardware split, attachment, warm-up).",
     )
-    overview_parser.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    overview_parser.add_argument("--json", action="store_true", help=_JSON_HELP)
     overview_parser.set_defaults(func=cmd_stream_overview)
 
     video = noun_sub.add_parser(
