@@ -17,7 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- README quickstart invoked `uv run webcam-cli whoami` / `learn`, which fails with 'Failed to spawn' — `[project.scripts]` installs the console command as `webcam`, not `webcam-cli`. Corrected to `webcam`, and the deliberate command/package/dist name split is now stated explicitly. The same mismatch inside the CLI's own self-description (argparse `prog="webcam-cli"`, so `--help`, every error hint, `learn`, and the whole `explain` catalog point agents at a command that is not installed) is documented in CLAUDE.md as an open defect rather than fixed here, since it changes agent-visible output under the rubric gate.
+- README quickstart invoked `uv run webcam-cli whoami` / `learn`, which fails with 'Failed to spawn' — `[project.scripts]` installs the console command as `webcam`, not `webcam-cli`. Corrected to `webcam`, and the deliberate command/package/dist name split is now stated explicitly. The same mismatch inside the CLI's own self-description (argparse `prog="webcam-cli"`, so `--help`, every error hint, `learn`, and the whole `explain` catalog point agents at a command that is not installed) is documented in CLAUDE.md as an open defect rather than fixed here, since it changes agent-visible output under the rubric gate. The README now also carries a Known-defect note so a reader who follows a `hint:` into the nonexistent `webcam-cli` binary can reconcile it; the fix is tracked in [#3](https://github.com/agentculture/webcam-cli/issues/3), which pairs it with the self-description rewrite because both touch the same strings.
 
 ## [0.6.1] - 2026-07-20
 

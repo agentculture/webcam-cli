@@ -25,6 +25,8 @@ uv run teken cli doctor . --strict    # the agent-first rubric gate CI runs
 
 The console command is `webcam`. The import package is `webcam_cli` and the PyPI distribution is `webcam-cli` — deliberately decoupled, so the ergonomic thing you type stays short while the import cannot shadow a generic `webcam` module in a consumer's environment.
 
+> **Known defect:** the CLI does not yet call itself by its installed name. `webcam --help` prints `usage: webcam-cli`, and error hints, `learn`, and `explain` all tell you to run `webcam-cli …` — which is not installed and fails with `Failed to spawn`. Wherever the CLI says `webcam-cli`, type `webcam`. Tracked in [issue #3](https://github.com/agentculture/webcam-cli/issues/3); the fix lands with the self-description rewrite, since the same strings are also still describing this repo as a template.
+
 ## CLI
 
 Today's surface is the agent-first template baseline:
