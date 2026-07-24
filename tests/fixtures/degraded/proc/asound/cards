@@ -1,0 +1,4 @@
+ 0 [NVIDIA         ]: hda-acpi - NVIDIA
+                      NVIDIA HDA Controller at 0x36078000 irq 310
+ 1 [Mystery        ]: USB-Audio - Mystery Mic
+                      Mystery Mic at usb-NVDA9000:00-1, high speed
