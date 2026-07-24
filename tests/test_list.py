@@ -8,10 +8,11 @@ Covers both acceptance criteria:
 2. ``list`` exits 0 with a valid empty result when no devices are attached,
    and stderr is silent on success.
 
-The verb is not wired into ``webcam_cli.cli.main`` yet (that lands in a later
-task), so every test here builds a local ``argparse`` parser, calls
-``list_devices.register(sub)`` on it, and invokes the handler directly —
-never through ``webcam_cli.cli.main``.
+Every test here builds a local ``argparse`` parser, calls
+``list_devices.register(sub)`` on it, and invokes the handler directly, keeping
+the verb's behaviour separable from parser assembly. That the verb is
+*registered* in ``webcam_cli.cli.main`` (task t8) is asserted separately, in
+``tests/test_cli.py``.
 
 Hardware posture: per the operator-approved deviation for this wave, no test
 here opens, streams, or probes format capability on a device. The one thing

@@ -16,7 +16,10 @@ def resolve(path: tuple[str, ...]) -> str:
     raise CliError(
         code=EXIT_USER_ERROR,
         message=f"no explain entry for: {display}",
-        remediation="list entries with: webcam-cli explain webcam-cli",
+        remediation=(
+            "run 'webcam explain webcam' for the root entry, which lists every "
+            "documented noun and verb"
+        ),
     )
 
 

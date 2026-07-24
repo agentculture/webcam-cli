@@ -1,11 +1,12 @@
-"""``webcam-cli whoami`` — the smallest identity probe.
+"""``webcam whoami`` — the smallest identity probe.
 
 Reports the agent's identity as declared in ``culture.yaml``: its nick
 (``suffix``), the backend it runs on, and the served model (if any) — plus the
-package version. Read-only; touches nothing but its own ``culture.yaml``.
+package version. Read-only; touches nothing but its own ``culture.yaml``, and no
+capture hardware at all.
 
-When you clone this template, rename the package and update ``culture.yaml`` —
-``whoami`` then reflects your new agent's identity with no code change.
+The nick is ``webcam-cli`` — the project, distribution and mesh name — while the
+installed console command is ``webcam``.
 """
 
 from __future__ import annotations
