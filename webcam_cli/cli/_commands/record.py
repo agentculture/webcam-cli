@@ -73,13 +73,19 @@ The first frames off a UVC camera are dark while auto-exposure settles
 pipeline builders take a single ``sink`` string each and this module does not
 own that file, warm-up is implemented as a *separate, first* bounded phase of
 the same pipeline shape sunk to ``fakesink`` (discarding frames, writing
-nothing) for ``--warmup`` seconds, before the real recording phase opens the
-device again for the bounded recording window. Default:
-:data:`_DEFAULT_WARMUP_VIDEO_S` (2.0s) for any kind that captures video,
-:data:`_DEFAULT_WARMUP_AUDIO_S` (0.0s) for audio-only, since a microphone has
-no exposure to settle. ``--warmup 0`` is allowed on purpose — unlike the
-recording bound, a pre-roll discard of zero is a perfectly ordinary, finite
-choice, not an unbounded one.
+nothing), before the real recording phase opens the device again for the
+bounded recording window.
+
+The default is :data:`webcam_cli.engine.DEFAULT_WARMUP_FRAMES` frames
+converted through the **negotiated fps** — the same measured constant
+``webcam stream`` uses, so the two verbs cannot drift apart as they did while
+both were guesses (30 frames vs a flat 2.0 s). The unit matters: settle was
+measured to track frame count, not wall-clock time, so a fixed-seconds default
+under-warms at low frame rates. Audio-only defaults to
+:data:`_DEFAULT_WARMUP_AUDIO_S` (0.0 s), since a microphone has no exposure to
+settle. ``--warmup SECONDS`` overrides, and ``--warmup 0`` is allowed on
+purpose — unlike the recording bound, a pre-roll discard of zero is a
+perfectly ordinary, finite choice, not an unbounded one.
 """
 
 from __future__ import annotations
@@ -116,7 +122,16 @@ _MAX_BYTES_CEILING = 4 * 1024**3  # 4 GiB
 # Hard ceiling for --warmup; a pre-roll discard has no business being long.
 _MAX_WARMUP_S = 60.0
 
-_DEFAULT_WARMUP_VIDEO_S = 2.0
+# Video warm-up is expressed in *frames* and converted through the negotiated
+# fps, because that is what was measured: see
+# `webcam_cli.engine.DEFAULT_WARMUP_FRAMES` for the runs. The constant is
+# shared with `webcam stream` so the two verbs cannot drift apart again — they
+# disagreed (30 frames vs a flat 2.0 s) for as long as neither was measured.
+# `_DEFAULT_WARMUP_VIDEO_S` remains only as the fallback used when no format
+# has been negotiated yet and there is no fps to convert through.
+_DEFAULT_WARMUP_VIDEO_S = engine.warmup_seconds(
+    engine.DEFAULT_WARMUP_FRAMES, engine.WARMUP_FPS_ASSUMPTION
+)
 _DEFAULT_WARMUP_AUDIO_S = 0.0
 
 _DEFAULT_AUDIO_RATE = 48000
@@ -349,10 +364,42 @@ def _requested_audio_format(args: argparse.Namespace) -> engine.AudioFormat | No
     return engine.AudioFormat(rate=args.rate, channels=args.channels)
 
 
-def _resolve_warmup(warmup: float | None, kind: str) -> float:
+def _resolve_warmup(
+    warmup: float | None, kind: str, fmt: engine.VideoFormat | None = None
+) -> float:
+    """Seconds of pre-roll to discard: explicit, else the measured frame count.
+
+    An explicit ``--warmup`` is honoured verbatim. The default is
+    :data:`webcam_cli.engine.DEFAULT_WARMUP_FRAMES` frames converted through
+    the *negotiated* fps, so a 5 fps recording warms up for the same number of
+    frames as a 30 fps one — which is what the measurement says the sensor
+    needs. Audio has no exposure to settle and defaults to zero.
+    """
     if warmup is not None:
         return warmup
-    return _DEFAULT_WARMUP_VIDEO_S if kind in ("video", "av") else _DEFAULT_WARMUP_AUDIO_S
+    if kind not in ("video", "av"):
+        return _DEFAULT_WARMUP_AUDIO_S
+    if fmt is None:
+        return _DEFAULT_WARMUP_VIDEO_S
+    return engine.warmup_seconds(engine.DEFAULT_WARMUP_FRAMES, fmt.fps)
+
+
+def _warmup_frames(warmup: float | None, kind: str, fmt: engine.VideoFormat | None) -> int | None:
+    """How many frames the resolved warm-up actually discards, when knowable."""
+    if kind not in ("video", "av"):
+        return None
+    seconds = _resolve_warmup(warmup, kind, fmt)
+    fps = fmt.fps if fmt is not None else engine.WARMUP_FPS_ASSUMPTION
+    return round(seconds * fps)
+
+
+_WARMUP_BASIS = (
+    f"default = {engine.DEFAULT_WARMUP_FRAMES} frames converted through the negotiated "
+    "fps (about 2x the 13-15 frame auto-exposure settle measured on the reference C270 "
+    "at both 30 fps and 5 fps). Settle tracks frames, not wall-clock seconds, so a "
+    "fixed-seconds default under-warms at low frame rates. --warmup SECONDS overrides; "
+    "--warmup 0 disables. `webcam stream` uses the same measured constant."
+)
 
 
 def _validate_output_path(raw: str) -> str:
@@ -605,8 +652,23 @@ def _run_bounded_phase(
     )
 
 
-def _require_artifact(output_path: str, result: _PhaseResult) -> int:
-    """Confirm exactly the named artifact was written; never trust a return code alone."""
+def _require_artifact(
+    output_path: str, result: _PhaseResult, *, busy_path: str | None = None
+) -> int:
+    """Confirm exactly the named artifact was written; never trust a return code alone.
+
+    When the pipeline's own output says the capture device was already held,
+    the caller gets the typed *busy* error naming the holder rather than a
+    generic "produced no output". That mapping is necessary because V4L2
+    exclusivity never reaches ``open(2)`` — see
+    :func:`webcam_cli.access.busy_error`. ``busy_path`` is the video node to
+    attribute a busy failure to; ``None`` for audio-only recordings, whose
+    busy state ALSA already reports from ``require_access``.
+    """
+    engine_output = f"{result.stderr or ''}\n{result.stdout or ''}"
+    if busy_path is not None and engine.output_reports_device_busy(engine_output):
+        raise access.busy_error(busy_path, "video")
+
     try:
         size = os.path.getsize(output_path)
     except OSError as exc:
@@ -680,7 +742,7 @@ def _dry_run(
     requested_video: engine.VideoFormat | None,
     requested_audio: engine.AudioFormat | None,
     bound: Bound,
-    warmup_s: float,
+    warmup: float | None,
     output_path: str,
     probe: bool,
 ) -> dict[str, object]:
@@ -712,6 +774,7 @@ def _dry_run(
         )
 
     cap = engine.detect()
+    warmup_s = _resolve_warmup(warmup, kind, planned_video)
 
     return {
         "mode": "dry-run",
@@ -741,6 +804,8 @@ def _dry_run(
         "pipeline_preview": pipeline_preview,
         "bound": bound.as_dict(),
         "warmup_s": warmup_s,
+        "warmup_frames": _warmup_frames(warmup, kind, planned_video),
+        "warmup_basis": _WARMUP_BASIS,
         "output_path": output_path,
         "would_write": [output_path],
         "access": _access_report(device, kind, capture_node),
@@ -763,7 +828,7 @@ def _apply(
     requested_video: engine.VideoFormat | None,
     requested_audio: engine.AudioFormat | None,
     bound: Bound,
-    warmup_s: float,
+    warmup: float | None,
     output_path: str,
 ) -> dict[str, object]:
     def _do(act: activation.Activation) -> dict[str, object]:
@@ -786,6 +851,8 @@ def _apply(
             negotiated_audio = requested_audio or engine.AudioFormat(
                 rate=_DEFAULT_AUDIO_RATE, channels=_DEFAULT_AUDIO_CHANNELS
             )
+
+        warmup_s = _resolve_warmup(warmup, kind, negotiated_video)
 
         sink = f"filesink location={shlex.quote(output_path)}"
         record_argv, warmup_argv = _build_pipelines(
@@ -810,7 +877,11 @@ def _apply(
         )
         ended_at = _now_iso()
 
-        size = _require_artifact(output_path, result)
+        size = _require_artifact(
+            output_path,
+            result,
+            busy_path=capture_node if kind in ("video", "av") else None,
+        )
 
         act.detail.update(
             {
@@ -852,6 +923,8 @@ def _apply(
             ),
             "bound": bound.as_dict(),
             "warmup_s": warmup_s,
+            "warmup_frames": _warmup_frames(warmup, kind, negotiated_video),
+            "warmup_basis": _WARMUP_BASIS,
             "output_path": output_path,
             "bytes_written": size,
             "stopped_reason": result.stopped_reason,
@@ -905,7 +978,6 @@ def cmd_record(args: argparse.Namespace) -> int:
     root = getattr(args, "root", None) or "/"
     device = devices.resolve(args.device, root=root)
     capture_node, audio_address = _capture_targets(device, kind)
-    warmup_s = _resolve_warmup(args.warmup, kind)
     bound = _build_bound(args.duration, args.max_bytes)
 
     if args.apply:
@@ -917,7 +989,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             requested_video=requested_video,
             requested_audio=requested_audio,
             bound=bound,
-            warmup_s=warmup_s,
+            warmup=args.warmup,
             output_path=output_path,
         )
     else:
@@ -929,7 +1001,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             requested_video=requested_video,
             requested_audio=requested_audio,
             bound=bound,
-            warmup_s=warmup_s,
+            warmup=args.warmup,
             output_path=output_path,
             probe=bool(args.probe),
         )
@@ -1028,8 +1100,10 @@ def register(sub: argparse._SubParsersAction) -> None:
         metavar="SECONDS",
         help=(
             "Sensor warm-up discarded before the recorded window, letting auto-exposure "
-            f"settle (default: {_DEFAULT_WARMUP_VIDEO_S:g}s for video/av, "
-            f"{_DEFAULT_WARMUP_AUDIO_S:g}s for audio-only). 0 is allowed -- this is a "
+            f"settle. Default: {engine.DEFAULT_WARMUP_FRAMES} frames converted through the "
+            f"negotiated fps ({_DEFAULT_WARMUP_VIDEO_S:g}s at "
+            f"{engine.WARMUP_FPS_ASSUMPTION:g}fps) for video/av, "
+            f"{_DEFAULT_WARMUP_AUDIO_S:g}s for audio-only. 0 is allowed -- this is a "
             "pre-roll setting, not the recording bound."
         ),
     )

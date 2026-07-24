@@ -832,6 +832,104 @@ class TestApply:
         payload = _out(["record", "C270", str(output), "--apply", "--json"], capsys)
         assert payload["bytes_written"] == len(b"fake-mkv-bytes")
 
+    def test_apply_warmup_default_is_a_frame_count_not_a_fixed_interval(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """The default warm-up must scale with the negotiated frame rate.
+
+        Auto-exposure settle was measured on the reference C270 (task t9) at
+        13-15 *frames* whether the camera ran at 30 fps or at 5 fps — the
+        wall-clock interval grew five-fold while the frame count barely
+        moved. A fixed-seconds default is therefore right at exactly one
+        frame rate and under-warms at every lower one.
+        """
+        output = tmp_path / "clip.mkv"
+        self._apply_env(monkeypatch, output)
+        monkeypatch.setattr(
+            record.engine,
+            "probe_formats",
+            lambda node: (engine.VideoFormat(pixel_format="MJPG", width=640, height=480, fps=5.0),),
+        )
+
+        payload = _out(["record", "C270", str(output), "--apply", "--json"], capsys)
+
+        assert payload["warmup_frames"] == engine.DEFAULT_WARMUP_FRAMES
+        assert payload["warmup_s"] == pytest.approx(engine.DEFAULT_WARMUP_FRAMES / 5.0)
+        assert payload["warmup_s"] > record._DEFAULT_WARMUP_VIDEO_S
+        assert "frames" in payload["warmup_basis"]
+
+    def test_apply_warmup_at_30fps_matches_the_stream_verbs_constant(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        output = tmp_path / "clip.mkv"
+        self._apply_env(monkeypatch, output)  # _SAMPLE_FORMATS negotiates 30 fps
+
+        payload = _out(["record", "C270", str(output), "--apply", "--json"], capsys)
+
+        assert payload["warmup_s"] == pytest.approx(
+            engine.warmup_seconds(engine.DEFAULT_WARMUP_FRAMES, 30.0)
+        )
+        assert payload["warmup_frames"] == engine.DEFAULT_WARMUP_FRAMES
+
+    def test_apply_explicit_warmup_still_wins(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        output = tmp_path / "clip.mkv"
+        self._apply_env(monkeypatch, output)
+        payload = _out(
+            ["record", "C270", str(output), "--apply", "--warmup", "0.5", "--json"], capsys
+        )
+        assert payload["warmup_s"] == 0.5
+
+    def test_apply_on_a_busy_camera_is_the_typed_busy_error(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """V4L2 busy never reaches open(2); it only shows up in engine output.
+
+        Verified on hardware (task t9) against a genuinely held C270:
+        ``require_access`` passed and the pipeline died with
+        ``Device '/dev/video0' is busy``.
+        """
+        output = tmp_path / "clip.mkv"
+        monkeypatch.setattr(record.engine, "probe_formats", lambda node: _SAMPLE_FORMATS)
+        monkeypatch.setattr(
+            record.access, "find_holder", lambda path: access.Holder(pid=77, command="gst-launch")
+        )
+
+        class _BusyProc:
+            def __init__(self, argv: list[str], **kwargs: object) -> None:
+                self.argv = argv
+                self.returncode = 1
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return "", "ERROR: Device '/dev/video0' is busy\n"
+
+        monkeypatch.setattr(record.subprocess, "Popen", _BusyProc)
+
+        args = _parse(["record", "C270", str(output), "--apply", "--warmup", "0"])
+        with pytest.raises(CliError) as exc:
+            args.func(args)
+
+        assert exc.value.code == EXIT_ENV_ERROR
+        assert "busy" in exc.value.message
+        assert "/dev/video0" in exc.value.message
+        assert "pid 77" in exc.value.message
+
     def test_apply_calls_require_engine_and_require_access(
         self,
         env,

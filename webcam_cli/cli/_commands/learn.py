@@ -84,6 +84,17 @@ Bounds
 ceiling 3600s) and no flag combination expresses "forever". `stream` is
 unbounded by construction: there is no --duration; stop it with SIGINT/SIGTERM.
 
+Warm-up
+-------
+The first frames off a UVC sensor are unsettled while auto-exposure converges,
+so both verbs discard a pre-roll before any frame reaches you. The default is
+30 frames, converted through the negotiated fps (1.0s at 30fps, 6.0s at 5fps);
+`stream audio` adds 200ms of ring-fill, and audio-only recording warms up not at
+all. Override with --warmup-frames/--warmup-ms (stream) or --warmup (record); 0
+disables. The frame count is measured on this project's reference C270 — settle
+held at 13-15 frames at both 30fps and 5fps, so it tracks frames rather than
+seconds — with a 2x margin that is deliberate and not itself measured.
+
 Machine-readable output
 -----------------------
 Every command supports --json. Errors in JSON mode emit

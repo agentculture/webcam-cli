@@ -645,6 +645,96 @@ def test_apply_av_pipeline_carries_both_node_and_alsa_address(
     assert emitted[-1]["attach"]["streams"]["audio"]["caps"].startswith("audio/x-raw")
 
 
+def test_av_consumer_gives_every_demuxer_branch_its_own_queue(
+    monkeypatch: pytest.MonkeyPatch, emitted: list[object]
+) -> None:
+    """Without a queue per branch, no consumer can decode an av stream at all.
+
+    Measured on hardware (task t9): the announced av consumer *without* these
+    queues delivered 0 video buffers and 1 audio buffer — both from a live
+    stream and from a known-good recorded file — because a demuxer fanning
+    out to two branches runs them from a single streaming thread and stalls.
+    The identical command with a queue on each branch delivered 40 video and
+    268 audio buffers from that same file.
+    """
+    _apply_ready(monkeypatch)
+    assert _run(["stream", "av", "c270", "--apply", "--port", "0", "--json"]) == 0
+
+    command = emitted[-1]["attach"]["consumer"]["gst_launch_str"]
+    branches = command.split("demux. ! ")[1:]
+    assert len(branches) == 2, command
+    assert all(branch.startswith("queue ! ") for branch in branches), command
+
+
+def test_single_medium_consumers_need_no_queue(
+    monkeypatch: pytest.MonkeyPatch, emitted: list[object]
+) -> None:
+    """One branch off the demuxer cannot stall, and is left plain on purpose."""
+    _apply_ready(monkeypatch)
+    assert _run(["stream", "video", "c270", "--apply", "--port", "0", "--json"]) == 0
+    assert "demux." not in emitted[-1]["attach"]["consumer"]["gst_launch_str"]
+
+
+def test_apply_activation_record_carries_the_negotiated_format_and_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Late-resolved facts must reach the log, not a dict nobody reads.
+
+    ``activation_scope`` copies the detail mapping it is handed, so writing to
+    the caller's own dict after entering the scope is silently lost. On
+    hardware (task t9) that meant every live stream's consent record was
+    missing the format it captured, the warm-up it applied, and the pid of the
+    process holding the camera.
+    """
+    _apply_ready(monkeypatch)
+    assert _run(["stream", "video", "c270", "--apply", "--port", "0", "--json"]) == 0
+
+    detail = _log_lines(tmp_path)[0]["detail"]
+    assert detail["negotiated"] == {
+        "pixel_format": "MJPG",
+        "width": 1280,
+        "height": 720,
+        "fps": 30.0,
+    }
+    assert detail["pid"] == 4242
+    assert detail["warmup_ms"] == 1000.0
+
+
+def test_a_busy_v4l2_device_becomes_the_typed_busy_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V4L2 exclusivity is invisible to open(2); the engine output is the tell.
+
+    uvcvideo permits several opens of a ``/dev/video*`` node and only refuses
+    at ``S_FMT``, so the access gate passes and the pipeline dies instead.
+    Verified on hardware (task t9) against a genuinely held C270.
+    """
+    _grant_engine(monkeypatch)
+    _grant_probe(monkeypatch)
+    _grant_access(monkeypatch)
+    monkeypatch.setattr(
+        access, "find_holder", lambda path: access.Holder(pid=99, command="gst-launch-1.0")
+    )
+
+    tail = (
+        "ERROR: from element /GstPipeline:pipeline0/GstV4l2Src:v4l2src0: "
+        "Device '/dev/video0' is busy\n"
+        "Call to S_FMT failed for MJPG @ 1280x960: Device or resource busy"
+    )
+    monkeypatch.setattr(
+        stream, "_spawn", lambda argv: _FakeProc(argv=list(argv), returncode=1, tail=tail)
+    )
+
+    with pytest.raises(CliError) as exc:
+        _run(["stream", "video", "c270", "--apply", "--port", "0"])
+
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "busy" in exc.value.message
+    assert "/dev/video0" in exc.value.message
+    assert "pid 99" in exc.value.message
+    assert "gst-launch-1.0" in exc.value.remediation
+
+
 def test_apply_writes_only_the_json_payload_to_stdout(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -803,6 +893,18 @@ def test_warmup_default_is_documented_in_the_payload(emitted: list[object]) -> N
     assert warmup["caveat"]
     assert warmup["source"].startswith("default")
     assert any("--warmup-frames" in override for override in warmup["overrides"])
+    # The default is measured, not guessed, and the payload has to say so.
+    assert "measured" in warmup["basis"]
+
+
+def test_stream_and_record_share_one_measured_warmup_constant() -> None:
+    """The two verbs disagreed while both were guesses; they cannot now drift."""
+    from webcam_cli.cli._commands import record
+
+    assert stream.DEFAULT_WARMUP_FRAMES == engine.DEFAULT_WARMUP_FRAMES
+    assert record._DEFAULT_WARMUP_VIDEO_S == engine.warmup_seconds(
+        engine.DEFAULT_WARMUP_FRAMES, engine.WARMUP_FPS_ASSUMPTION
+    )
 
 
 def test_warmup_frames_are_overridable_and_zero_disables(

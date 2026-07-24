@@ -66,10 +66,10 @@ while no client is connected, so those frames are discarded rather than queued.
 The default is :data:`DEFAULT_WARMUP_FRAMES` frames for video (converted through
 the negotiated fps) and :data:`DEFAULT_AUDIO_WARMUP_MS` ms for audio, both
 overridable (``--warmup-frames`` / ``--warmup-ms``, ``--warmup-frames 0``
-disables). **The video default is provisional**: the reference host's C270
-settle time has not been measured yet (that needs hardware, which is task t9's
-job), so a conservative ~1 s was chosen over a guess that risks shipping dark
-frames.
+disables). The video default is now *measured*, not guessed:
+:data:`webcam_cli.engine.DEFAULT_WARMUP_FRAMES` carries the runs and the
+numbers, including why the unit is frames rather than seconds. ``record``
+derives its default from the same constant, so the two verbs cannot drift.
 
 Unbounded by design
 -------------------
@@ -120,12 +120,11 @@ SINK_ELEMENT = "tcpserversink"
 #: Container for every stream shape, so the wire format is self-describing.
 CONTAINER = "matroska"
 
-#: Video warm-up default, in frames. Provisional: ~1 s at 30 fps, chosen
-#: conservatively because the C270's auto-exposure settle time is *unmeasured*
-#: (plan risk r3 — measuring it needs hardware, which is task t9). A stream is
-#: unbounded, so a one-off second of warm-up costs nothing per stream, whereas
-#: too-short a warm-up hands the first consumer dark frames.
-DEFAULT_WARMUP_FRAMES = 30
+#: Video warm-up default, in frames. Measured on the reference host's C270 —
+#: see :data:`webcam_cli.engine.DEFAULT_WARMUP_FRAMES` for the runs, the
+#: numbers, and why the unit is frames rather than seconds. Shared with
+#: ``record`` so the two verbs cannot drift apart again.
+DEFAULT_WARMUP_FRAMES = engine.DEFAULT_WARMUP_FRAMES
 
 #: Audio warm-up default, in milliseconds. Frames are meaningless for ALSA, and
 #: there is no auto-exposure equivalent — this covers ring-buffer fill only, so
@@ -134,7 +133,7 @@ DEFAULT_AUDIO_WARMUP_MS = 200.0
 
 #: fps assumed when a warm-up interval must be reported before any format has
 #: been negotiated (an on-paper dry run). Reported as ``fps_assumed: true``.
-WARMUP_FPS_ASSUMPTION = 30.0
+WARMUP_FPS_ASSUMPTION = engine.WARMUP_FPS_ASSUMPTION
 
 _TERMINATE_TIMEOUT_S = 5
 _OUTPUT_TAIL_BYTES = 2000
@@ -318,9 +317,10 @@ def _logged_activation(
 
     Every ``OSError`` this sees comes from the log write, because the body
     below converts its own OS-level failures (``_spawn``) into ``CliError``
-    first. ``detail`` is mutated in place by the body; the scope writes the
-    same dict object on exit, so late-resolved facts (the negotiated format,
-    the child pid) still land in the record.
+    first. Note that ``activation_scope`` **copies** the ``detail`` mapping it
+    is handed: late-resolved facts (the negotiated format, the child pid) must
+    be written to ``act.detail``, not to the dict passed in here, or they never
+    reach the log.
     """
     try:
         with activation.activation_scope(
@@ -792,6 +792,16 @@ _WARMUP_OVERRIDES = (
     "--warmup-frames 0 (disable warm-up entirely)",
 )
 
+_WARMUP_BASIS = (
+    f"the default is {engine.DEFAULT_WARMUP_FRAMES} frames, about 2x the "
+    "auto-exposure settle measured on this project's reference C270 (13-15 frames "
+    "across cold opens at 30 fps and at 5 fps). Settle held at a near-constant "
+    "*frame count* while wall-clock time grew five-fold, which is why the unit is "
+    "frames and not seconds. The 2x margin is not itself measured: every run was "
+    "under one indoor lighting condition, and a darker scene should be expected to "
+    "settle more slowly"
+)
+
 
 def _warmup(ctx: _Context, fmt: engine.VideoFormat | None) -> dict[str, object]:
     explicit_ms = getattr(ctx.args, "warmup_ms", None)
@@ -837,16 +847,41 @@ def _warmup_dict(
         "applied": ms > 0,
         "mechanism": _WARMUP_MECHANISM,
         "caveat": _WARMUP_CAVEAT,
-        "provisional": (
-            "the video default is unmeasured on this hardware — it is a conservative "
-            "~1s at 30fps pending an on-host measurement of the C270's auto-exposure "
-            "settle time"
-        ),
+        "basis": _WARMUP_BASIS,
         "overrides": list(_WARMUP_OVERRIDES),
     }
 
 
-def _warm_up(proc: _StreamProcess, warmup: dict[str, object]) -> None:
+def _pipeline_error(ctx: _Context, tail: str, message: str) -> CliError:
+    """Type a dead pipeline as specifically as its output allows.
+
+    "The device was already open" is the failure an agent most needs named,
+    and it is the one the access check cannot see: uvcvideo permits several
+    opens of a ``/dev/video*`` node and only refuses at ``S_FMT``, so
+    :func:`webcam_cli.access.check_access` calls a camera another process is
+    streaming from ``ok``. Verified on hardware (task t9): a second
+    ``--apply`` against the held C270 passed the access gate and died in the
+    engine with ``Device '/dev/video0' is busy``. When that phrase is in the
+    output, the caller gets the same typed busy error — naming the holding
+    process — that ALSA produces from ``open`` for the same device's mic.
+    """
+    if engine.output_reports_device_busy(tail):
+        if ctx.node is not None:
+            return access.busy_error(ctx.node, "video")
+        if ctx.alsa is not None and ctx.device.audio is not None:
+            return access.busy_error(_alsa_node_path(ctx.device.audio), "audio")
+    return CliError(
+        EXIT_ENV_ERROR,
+        message,
+        remediation=(
+            "the requested format or audio parameters may not be accepted by the device, "
+            "or another client took it — re-run with --probe to see what the device "
+            "enumerates, and check `webcam list --json` for access state"
+        ),
+    )
+
+
+def _warm_up(ctx: _Context, proc: _StreamProcess, warmup: dict[str, object]) -> None:
     """Wait out the warm-up interval, then assert the pipeline is still alive."""
     seconds = float(warmup["ms"]) / 1000.0  # type: ignore[arg-type]
     if seconds > 0:
@@ -856,14 +891,10 @@ def _warm_up(proc: _StreamProcess, warmup: dict[str, object]) -> None:
         return
     tail = proc.output_tail()
     detail = f": {tail}" if tail else ""
-    raise CliError(
-        EXIT_ENV_ERROR,
+    raise _pipeline_error(
+        ctx,
+        tail,
         f"the capture pipeline exited during warm-up with status {status}{detail}",
-        remediation=(
-            "the requested format or audio parameters may not be accepted by the device, "
-            "or another client took it — re-run with --probe to see what the device "
-            "enumerates, and check `webcam list --json` for access state"
-        ),
     )
 
 
@@ -956,10 +987,19 @@ def _consumer(ctx: _Context, video: dict[str, object] | None) -> dict[str, objec
         adec = "opusdec ! " if ctx.encode == "opus" else ""
         chain = f"matroskademux ! {adec}audioconvert ! fakesink sync=false"
     else:
+        # Each branch off the demuxer gets its own queue. This is not
+        # decoration: a demuxer fanning out to two branches runs both from one
+        # streaming thread unless a queue puts a thread boundary in each, and
+        # without them the whole pipeline stalls. Measured on hardware
+        # (task t9): the queue-less form delivered **0 video and 1 audio
+        # buffer** from a live av stream and from a known-good recorded file
+        # alike; the same command with these two queues delivered 40 video and
+        # 268 audio buffers from that file. Single-medium consumers below have
+        # only one branch and need no queue.
         chain = (
             "matroskademux name=demux "
-            f"demux. ! {vdec}videoconvert ! fakesink sync=false "
-            "demux. ! audioconvert ! fakesink sync=false"
+            f"demux. ! queue ! {vdec}videoconvert ! fakesink sync=false "
+            "demux. ! queue ! audioconvert ! fakesink sync=false"
         )
 
     command = f"gst-launch-1.0 {source} ! {chain}"
@@ -1195,8 +1235,15 @@ def _hardware_run(ctx: _Context) -> int:
         negotiation, fmt = _negotiate(ctx)
         warmup = _warmup(ctx, fmt)
         argv = _pipeline(ctx, fmt)
-        detail["negotiated"] = negotiation["negotiated"]
-        detail["warmup_ms"] = warmup["ms"]
+        # `act.detail`, not the local `detail`: activation_scope copies the
+        # dict it is handed, so anything written to the local one after entry
+        # never reaches the log. Verified on hardware (task t9) — every live
+        # stream's record was missing its negotiated format, warm-up and child
+        # pid, which is exactly the forensic detail the consent posture
+        # promises. The scope keeps `act.detail` by reference, so writing here
+        # lands in the line.
+        act.detail["negotiated"] = negotiation["negotiated"]
+        act.detail["warmup_ms"] = warmup["ms"]
 
         if not ctx.apply_mode:
             _emit(
@@ -1216,8 +1263,8 @@ def _hardware_run(ctx: _Context) -> int:
 
         assert argv is not None
         proc = _spawn(argv)
-        detail["pid"] = proc.pid
-        _warm_up(proc, warmup)
+        act.detail["pid"] = proc.pid
+        _warm_up(ctx, proc, warmup)
         _emit(
             _payload(
                 ctx,
@@ -1234,14 +1281,11 @@ def _hardware_run(ctx: _Context) -> int:
         status = _supervise(proc)
         if status:
             tail = proc.output_tail()
-            detail["exit_status"] = status
-            raise CliError(
-                EXIT_ENV_ERROR,
+            act.detail["exit_status"] = status
+            raise _pipeline_error(
+                ctx,
+                tail,
                 f"the stream pipeline exited with status {status}" + (f": {tail}" if tail else ""),
-                remediation=(
-                    "the device may have been unplugged or claimed by another client — "
-                    "re-run with --probe to check what it enumerates"
-                ),
             )
         return 0
 
@@ -1326,11 +1370,15 @@ def stream_sections() -> list[dict[str, object]]:
         {
             "title": "Warm-up",
             "items": [
-                "the first frames off a UVC sensor are dark while auto-exposure settles; "
-                "warm-up runs the pipeline before announcing the attachment point so "
-                "those frames are discarded",
-                f"defaults: {DEFAULT_WARMUP_FRAMES} frames (video/av) and "
-                f"{DEFAULT_AUDIO_WARMUP_MS} ms (audio)",
+                "the first frames off a UVC sensor are unsettled while auto-exposure "
+                "converges; warm-up runs the pipeline before announcing the attachment "
+                "point so those frames are discarded",
+                f"defaults: {DEFAULT_WARMUP_FRAMES} frames (video/av), converted through "
+                f"the negotiated fps, and {DEFAULT_AUDIO_WARMUP_MS} ms (audio)",
+                f"the {DEFAULT_WARMUP_FRAMES}-frame default is measured on the reference "
+                "C270 (13-15 frames to settle at 30 fps and at 5 fps alike, so settle "
+                "tracks frames rather than seconds); `webcam record` uses the same "
+                "constant",
                 "override with --warmup-frames <N> or --warmup-ms <MS>; "
                 "--warmup-frames 0 disables it",
             ],

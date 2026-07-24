@@ -505,3 +505,40 @@ def test_find_holder_is_bounded_over_many_pids(monkeypatch: pytest.MonkeyPatch) 
 
     assert holder is None
     assert elapsed < 2.0
+
+
+# --- busy_error(): the V4L2 gap open(2) cannot see -------------------------
+
+
+def test_busy_error_names_the_holder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The typed busy error for callers that learned "busy" some other way.
+
+    V4L2 exclusivity never surfaces on ``open``: uvcvideo permits several
+    opens of the same node and only refuses at ``S_FMT``. Measured on the
+    reference host (task t9) while a stream held the C270: ``check_access``
+    on ``/dev/video0`` returned OK, while ``check_access`` on that same
+    physical device's ALSA node correctly returned BUSY.
+    """
+    monkeypatch.setattr(access, "find_holder", lambda path: Holder(pid=4242, command="gst-launch"))
+
+    err = access.busy_error("/dev/video0", "video")
+
+    assert err.code == EXIT_ENV_ERROR
+    assert "/dev/video0" in err.message
+    assert "busy" in err.message
+    assert "pid 4242" in err.message
+    assert "gst-launch" in err.remediation
+
+
+def test_busy_error_degrades_when_the_holder_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(access, "find_holder", lambda path: None)
+
+    err = access.busy_error("/dev/video0", "video")
+
+    assert err.code == EXIT_ENV_ERROR
+    assert "could not be identified" in err.remediation
+
+
+def test_busy_error_rejects_an_invalid_kind() -> None:
+    with pytest.raises(ValueError):
+        access.busy_error("/dev/video0", "haptics")
