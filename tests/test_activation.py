@@ -210,13 +210,17 @@ def test_activation_scope_writes_one_line_on_success(tmp_path: Path) -> None:
 
 def test_activation_scope_writes_one_line_on_exception(tmp_path: Path) -> None:
     log = tmp_path / "activations.jsonl"
+    # Constructing the context manager cannot raise (it's a plain @contextmanager
+    # object, nothing runs until __enter__); hoisting it above pytest.raises leaves
+    # exactly one call inside the block that can actually throw.
+    cm = activation_scope(
+        device_id="usb-1234_arducam",
+        verb="record",
+        target="/tmp/clip.mp4",
+        path=log,
+    )
     with pytest.raises(RuntimeError, match="boom"):
-        with activation_scope(
-            device_id="usb-1234_arducam",
-            verb="record",
-            target="/tmp/clip.mp4",
-            path=log,
-        ):
+        with cm:
             raise RuntimeError("boom")
 
     lines = log.read_text(encoding="utf-8").splitlines()
@@ -230,14 +234,17 @@ def test_activation_scope_writes_one_line_on_exception(tmp_path: Path) -> None:
 
 def test_activation_scope_preserves_caller_error_detail(tmp_path: Path) -> None:
     log = tmp_path / "activations.jsonl"
+    # Same hoist as above: build the context manager (cannot raise) before
+    # pytest.raises so only the deliberate raise below is inside the block.
+    cm = activation_scope(
+        device_id="dev",
+        verb="stream",
+        target="t",
+        detail={"error": "already explained by caller"},
+        path=log,
+    )
     with pytest.raises(ValueError):
-        with activation_scope(
-            device_id="dev",
-            verb="stream",
-            target="t",
-            detail={"error": "already explained by caller"},
-            path=log,
-        ):
+        with cm:
             raise ValueError("nope")
 
     record = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
@@ -265,10 +272,13 @@ def test_activation_module_writes_only_the_log(tmp_path: Path) -> None:
     with activation_scope(device_id="usb-x", verb="stream", target="rtsp://out", path=log):
         pass  # this module never touches "target" — capture is out of lane
 
+    # Hoisted for the same reason as the two tests above: construction cannot
+    # raise, so only the deliberate raise below is inside pytest.raises.
+    cm = activation_scope(
+        device_id="usb-x", verb="record", target=str(tmp_path / "clip.mp4"), path=log
+    )
     with pytest.raises(RuntimeError):
-        with activation_scope(
-            device_id="usb-x", verb="record", target=str(tmp_path / "clip.mp4"), path=log
-        ):
+        with cm:
             raise RuntimeError("crashed mid-record")
 
     created_files = {p for p in tmp_path.rglob("*") if p.is_file()}
