@@ -596,14 +596,10 @@ def test_build_av_pipeline_shape_uses_matroskamux():
 
 
 def test_build_av_pipeline_rejects_bad_alsa_address():
+    afmt = engine.AudioFormat(rate=44100, channels=2)
+
     with pytest.raises(CliError) as exc_info:
-        engine.build_av_pipeline(
-            "/dev/video0",
-            _MJPG_720P,
-            "not-an-alsa-address",
-            engine.AudioFormat(rate=44100, channels=2),
-            "fakesink",
-        )
+        engine.build_av_pipeline("/dev/video0", _MJPG_720P, "not-an-alsa-address", afmt, "fakesink")
     assert exc_info.value.code == EXIT_USER_ERROR
 
 
