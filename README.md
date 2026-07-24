@@ -57,7 +57,9 @@ This tool opens cameras and microphones, so which invocations energize hardware 
 
 `list` opens nothing beyond one non-blocking permission probe per node.
 
-Sensor warm-up is applied before frames reach a consumer, since the first frames off a UVC camera are dark while auto-exposure settles. The defaults are **provisional and not yet reconciled**: `stream` discards ~30 frames of video (about 1s at 30fps) and 200ms of audio, while `record` discards 2.0s for video and 0.0s for audio. The reference camera's real settle time is unmeasured — measuring it needs hardware — so neither number is authoritative yet.
+Sensor warm-up is applied before frames reach a consumer, since the first frames off a UVC camera are unsettled while auto-exposure converges. Both verbs discard **30 frames** by default, converted through the negotiated frame rate — 1.0s at 30fps, 6.0s at 5fps — plus 200ms of audio ring-fill for `stream audio`; audio-only recording warms up for 0.0s, since a microphone has no exposure to settle. Override with `--warmup-frames N` / `--warmup-ms MS` (`stream`) or `--warmup SECONDS` (`record`); `0` disables.
+
+The unit is frames rather than seconds because that is what was measured. On the reference C270, auto-exposure settled after 13–15 frames whether the camera ran at 30fps or at 5fps — the frame count held while the wall-clock interval grew five-fold — so a fixed-seconds default is right at exactly one frame rate and under-warms at every lower one. 30 frames is about 2x the slowest settle observed; that margin is deliberate and is *not* itself measured, since every run was under one indoor lighting condition. The runs are recorded in [docs/acceptance-a-v-streaming.md](docs/acceptance-a-v-streaming.md) and reproducible with `scripts/acceptance/warmup-measure.py`.
 
 Every activation is appended to an activation log (`~/.local/state/webcam-cli/activations.jsonl` by default; override with `$WEBCAM_ACTIVATION_LOG`), and a capture writes only to the path you name — no hidden buffer, never to stdout.
 

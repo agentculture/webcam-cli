@@ -103,6 +103,66 @@ _DEVICE_MONITOR_OUTPUT = (
 )
 
 
+# The transcript actually observed on the reference host (GStreamer 1.24.2,
+# Ubuntu, PipeWire running). PipeWire's device provider calls
+# gst_device_provider_hide_provider("v4l2deviceprovider"), so *its* spelling is
+# the only one gst-device-monitor-1.0 emits here, and it differs from the
+# GStreamer v4l2 provider's in three ways that each independently broke
+# parsing before task t9 measured it on hardware:
+#
+#   1. no `device.path` property at all — the node path arrives as
+#      `api.v4l2.path` and as `object.path = v4l2:/dev/videoN`;
+#   2. caps are serialized *without* type annotations (`width=640`, not
+#      `width=(int)640`);
+#   3. every framerate is a *list* (`framerate={ (fraction)30/1, ... }`), not
+#      the single fraction the annotated spelling carries.
+#
+# Trimmed to three caps lines per device; otherwise byte-faithful.
+_PIPEWIRE_DEVICE_MONITOR_OUTPUT = (
+    "Probing devices...\n"
+    "\n"
+    "\n"
+    "Device found:\n"
+    "\n"
+    "\tname  : C270 HD WEBCAM (V4L2)\n"
+    "\tclass : Video/Source\n"
+    "\tcaps  : video/x-raw, format=YUY2, width=640, height=480, framerate={ "
+    "(fraction)30/1, (fraction)15/1 }\n"
+    "\t        video/x-raw, format=YUY2, width=(int)[1, 640], height=(int)[1, 480], "
+    "framerate=[ 0/1, 2147483647/1 ]\n"
+    "\t        image/jpeg, width=1280, height=720, framerate={ (fraction)30/1, "
+    "(fraction)5/1 }\n"
+    "\tproperties:\n"
+    "\t\tapi.v4l2.cap.card = C270 HD WEBCAM\n"
+    "\t\tapi.v4l2.cap.driver = uvcvideo\n"
+    "\t\tapi.v4l2.path = /dev/video0\n"
+    "\t\tdevice.api = v4l2\n"
+    "\t\tfactory.name = api.v4l2.source\n"
+    "\t\tmedia.class = Video/Source\n"
+    "\t\tobject.path = v4l2:/dev/video0\n"
+    "\tgst-launch-1.0 pipewiresrc target-object=76 ! ...\n"
+    "\n"
+    "\n"
+    "Device found:\n"
+    "\n"
+    "\tname  : Arducam_12MP (V4L2)\n"
+    "\tclass : Video/Source\n"
+    "\tcaps  : image/jpeg, width=1920, height=1080, framerate={ (fraction)30/1 }\n"
+    "\tproperties:\n"
+    "\t\tapi.v4l2.path = /dev/video2\n"
+    "\t\tobject.path = v4l2:/dev/video2\n"
+    "\tgst-launch-1.0 pipewiresrc target-object=78 ! ...\n"
+    "\n"
+)
+
+
+# Same shape, but with `api.v4l2.path` removed so only the `object.path =
+# v4l2:/dev/videoN` spelling is left to match on.
+_OBJECT_PATH_ONLY_OUTPUT = _PIPEWIRE_DEVICE_MONITOR_OUTPUT.replace(
+    "\t\tapi.v4l2.path = /dev/video0\n", ""
+)
+
+
 # --- Capability.detect() -----------------------------------------------------
 
 
@@ -273,6 +333,63 @@ def test_probe_formats_garbled_output_returns_empty_tuple_not_crash(monkeypatch)
     monkeypatch.setattr(engine.os.path, "realpath", lambda p: p)
 
     assert engine.probe_formats("/dev/video0") == ()
+
+
+def _fake_monitor(monkeypatch, output: str) -> None:
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(
+        engine.subprocess,
+        "run",
+        lambda *_a, **_kw: _FakeCompletedProcess(returncode=0, stdout=output),
+    )
+    monkeypatch.setattr(engine.os.path, "realpath", lambda p: p)
+
+
+def test_probe_formats_parses_the_pipewire_provider_transcript(monkeypatch):
+    """The spelling the reference host actually emits must parse (t9 finding).
+
+    Exercises all three divergences at once: the node path arrives as
+    ``api.v4l2.path``, caps carry no type annotations, and every framerate is
+    a list that has to be expanded into one VideoFormat per rate.
+    """
+    _fake_monitor(monkeypatch, _PIPEWIRE_DEVICE_MONITOR_OUTPUT)
+
+    formats = engine.probe_formats("/dev/video0")
+
+    assert formats == (
+        engine.VideoFormat(pixel_format="YUYV", width=640, height=480, fps=30.0),
+        engine.VideoFormat(pixel_format="YUYV", width=640, height=480, fps=15.0),
+        engine.VideoFormat(pixel_format="MJPG", width=1280, height=720, fps=30.0),
+        engine.VideoFormat(pixel_format="MJPG", width=1280, height=720, fps=5.0),
+    )
+
+
+def test_probe_formats_matches_object_path_spelling(monkeypatch):
+    """`object.path = v4l2:/dev/videoN` alone is enough to identify the device."""
+    _fake_monitor(monkeypatch, _OBJECT_PATH_ONLY_OUTPUT)
+
+    formats = engine.probe_formats("/dev/video0")
+
+    assert [fmt.pixel_format for fmt in formats] == ["YUYV", "YUYV", "MJPG", "MJPG"]
+
+
+def test_probe_formats_pipewire_transcript_isolates_devices(monkeypatch):
+    _fake_monitor(monkeypatch, _PIPEWIRE_DEVICE_MONITOR_OUTPUT)
+
+    assert engine.probe_formats("/dev/video2") == (
+        engine.VideoFormat(pixel_format="MJPG", width=1920, height=1080, fps=30.0),
+    )
+
+
+def test_probe_formats_skips_unannotated_range_valued_caps(monkeypatch):
+    """A range is not an enumeration — it must be skipped, never guessed at."""
+    _fake_monitor(monkeypatch, _PIPEWIRE_DEVICE_MONITOR_OUTPUT)
+
+    formats = engine.probe_formats("/dev/video0")
+
+    # The range line would have yielded 640x480 entries with a bogus fps.
+    assert all(fmt.fps in (30.0, 15.0, 5.0) for fmt in formats)
+    assert len(formats) == 4
 
 
 def test_probe_formats_binary_missing_raises_typed_env_error(monkeypatch):
@@ -501,3 +618,39 @@ def test_build_av_pipeline_argv_never_a_single_shell_string():
     assert isinstance(argv, list)
     assert all(isinstance(tok, str) for tok in argv)
     assert all(" ! " not in tok for tok in argv)  # never a pre-joined shell string
+
+
+# --- output_reports_device_busy() ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ERROR: from element GstV4l2Src:v4l2src0: Device '/dev/video0' is busy",
+        "Call to S_FMT failed for MJPG @ 1280x960: Device or resource busy",
+        "Could not open audio device for recording. Device is being used by another "
+        "application.\nresource busy",
+    ],
+)
+def test_output_reports_device_busy_recognises_the_engine_wording(text: str) -> None:
+    """Wordings captured verbatim from gst-launch-1.0 on the reference host."""
+    assert engine.output_reports_device_busy(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "ERROR: from element v4l2src0: Internal data stream error.",
+        "streaming stopped, reason not-negotiated (-4)",
+    ],
+)
+def test_output_reports_device_busy_does_not_over_claim(text: str) -> None:
+    assert engine.output_reports_device_busy(text) is False
+
+
+def test_warmup_seconds_converts_frames_through_fps() -> None:
+    assert engine.warmup_seconds(30, 30.0) == 1.0
+    assert engine.warmup_seconds(30, 5.0) == 6.0
+    assert engine.warmup_seconds(0, 30.0) == 0.0
+    assert engine.warmup_seconds(30, 0.0) == 0.0

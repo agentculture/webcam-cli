@@ -70,6 +70,54 @@ _OPTIONAL_ELEMENTS: tuple[str, ...] = (
 
 _ALL_ELEMENTS: tuple[str, ...] = _CORE_ELEMENTS + _OPTIONAL_ELEMENTS
 
+# --- measured sensor behaviour ------------------------------------------------
+
+#: Frames of sensor warm-up to discard before frames are handed to a consumer.
+#:
+#: **Measured on the reference host's Logitech C270** (task t9, five cold
+#: opens), by capturing MJPEG with warm-up disabled, decoding each frame to
+#: GRAY8, and taking the frame at which mean luma first stays within 2% of its
+#: final value. Reproduce with ``scripts/acceptance/warmup-measure.py``:
+#:
+#: ======================  ===  ===============  ===================
+#: run                     fps  settle (frames)  settle (wall clock)
+#: ======================  ===  ===============  ===================
+#: 640x480, cold            30   15               0.50 s
+#: 640x480, cold            30   12               0.40 s
+#: 1280x720, cold           30   14               0.47 s
+#: 640x480, cold             5   13               2.60 s
+#: 640x480, cold             5   15               3.00 s
+#: ======================  ===  ===============  ===================
+#:
+#: The 5 fps runs are the load-bearing ones: settle stayed in a 12-15 *frame*
+#: band while wall-clock time ranged from 0.40 s to 3.00 s. **Auto-exposure
+#: converges over a roughly constant number of frames, not a constant
+#: interval**, so a warm-up default expressed in seconds is wrong at any frame
+#: rate but the one it was tuned for — at 5 fps a 2 s default discards 10
+#: frames and still ships unsettled ones. Both ``stream`` and ``record``
+#: therefore derive their default from this frame count and the *negotiated*
+#: fps, from this one constant, so they cannot drift apart again.
+#:
+#: 30 frames is about 2x the slowest settle measured. The margin is deliberate
+#: and is *not* itself measured: all five runs were in one room over one
+#: evening, and a genuinely dark scene should be expected to settle more
+#: slowly. Callers who know their conditions can override
+#: (``--warmup-frames`` / ``--warmup-ms`` on ``stream``, ``--warmup`` on
+#: ``record``); 0 disables warm-up entirely.
+DEFAULT_WARMUP_FRAMES = 30
+
+#: fps assumed when a warm-up interval must be reported before any format has
+#: been negotiated (an on-paper dry run). Always reported as assumed.
+WARMUP_FPS_ASSUMPTION = 30.0
+
+
+def warmup_seconds(frames: int, fps: float) -> float:
+    """Convert a warm-up frame count into seconds at ``fps``."""
+    if frames <= 0 or fps <= 0:
+        return 0.0
+    return frames / fps
+
+
 # Timeout (seconds) applied to every gst-* subprocess call in this module.
 # Q4 in the build brief demands "fail fast, never hang" for device access;
 # the same posture applies to capability/format probing.
@@ -171,6 +219,29 @@ def detect() -> Capability:
     )
 
 
+#: How ``gst-launch-1.0`` says "somebody else already has this device".
+#: Observed verbatim on the reference host when a second client opened a
+#: camera the first was streaming from (task t9)::
+#:
+#:     ERROR: from element .../GstV4l2Src:v4l2src0: Device '/dev/video0' is busy
+#:     Call to S_FMT failed for MJPG @ 1280x960: Device or resource busy
+#:
+#: This matters because **V4L2 exclusivity is invisible to ``open(2)``**:
+#: uvcvideo permits several opens of the same node and only refuses at
+#: ``S_FMT``/``STREAMON``, so a permission-style probe reports a camera that
+#: another process is streaming from as perfectly openable. The engine's own
+#: output is the only place the fact surfaces. (ALSA is the opposite — it
+#: returns ``EBUSY`` from ``open`` — which is why audio never needed this.)
+_DEVICE_BUSY_RE = re.compile(
+    r"(?i)(device or resource busy|device\s+'[^']*'\s+is\s+busy|resource\s+busy)"
+)
+
+
+def output_reports_device_busy(text: str) -> bool:
+    """True when engine output says the capture device was already held."""
+    return bool(_DEVICE_BUSY_RE.search(text or ""))
+
+
 def require_engine() -> Capability:
     """Return the detected :class:`Capability`, or raise a typed exit-2 error.
 
@@ -197,12 +268,30 @@ def require_engine() -> Capability:
 _DEVICE_BLOCK_SPLIT_RE = re.compile(r"(?m)^Device found:\s*$")
 _CAPS_HEADER_RE = re.compile(r"^\s*caps\s*:\s*(.*)$")
 _PROPERTIES_HEADER_RE = re.compile(r"^\s*properties\s*:\s*$")
-_DEVICE_PATH_RE = re.compile(r"^\s*device\.path\s*=\s*(.+?)\s*$")
+_PROPERTY_RE = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.\-]+)\s*=\s*(?P<value>.+?)\s*$")
 
-_WIDTH_RE = re.compile(r"width=\(int\)(\d+)")
-_HEIGHT_RE = re.compile(r"height=\(int\)(\d+)")
-_FRAMERATE_RE = re.compile(r"framerate=\(fraction\)(\d+)/(\d+)")
-_RAW_FORMAT_RE = re.compile(r"format=\(string\)([A-Za-z0-9_]+)")
+# Property keys that can carry the device's ``/dev/videoN`` path. Which of
+# them appear depends on *which device provider* answered, and that is not a
+# choice this tool gets to make:
+#
+# * ``device.path`` — GStreamer's own ``v4l2deviceprovider``;
+# * ``api.v4l2.path`` / ``object.path`` — PipeWire's provider, which calls
+#   ``gst_device_provider_hide_provider("v4l2deviceprovider")`` and therefore
+#   *replaces* the GStreamer one wherever PipeWire is running (verified on the
+#   reference host, GStreamer 1.24.2 — task t9).
+#
+# All three are accepted, so the probe works with or without PipeWire.
+_DEVICE_PATH_KEYS = ("device.path", "api.v4l2.path", "object.path")
+
+# ``object.path`` is namespaced: ``v4l2:/dev/video0``. Strip the scheme.
+_OBJECT_PATH_SCHEME_RE = re.compile(r"^[A-Za-z0-9_.\-]+:(?=/)")
+
+# A leading GStreamer type annotation: ``(int)640``, ``(string)YUY2``,
+# ``(fraction)30/1``, ``(GstValueList){ ... }``.
+_TYPE_ANNOTATION_RE = re.compile(r"^\([^)]*\)\s*")
+
+_INT_VALUE_RE = re.compile(r"^\d+$")
+_FRACTION_VALUE_RE = re.compile(r"^(?P<num>\d+)\s*/\s*(?P<den>\d+)$")
 
 
 def _normalize_path(path: str) -> str:
@@ -212,44 +301,133 @@ def _normalize_path(path: str) -> str:
         return path
 
 
-def _parse_caps_line(line: str) -> VideoFormat | None:
-    """Parse one ``gst-device-monitor-1.0`` caps line into a VideoFormat.
+def _split_top_level(text: str) -> list[str]:
+    """Split on commas that are not inside ``{...}`` or ``[...]``."""
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in text:
+        if char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+        if char == "," and depth <= 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
 
-    Defensive by design: a line this module does not recognise (an
-    unsupported media type, or a range/list-valued field such as
-    ``width=(int)[1, 640]`` instead of a discrete value) is skipped rather
-    than guessed at — never a crash, never a wrong answer.
+
+def _strip_type(value: str) -> str:
+    return _TYPE_ANNOTATION_RE.sub("", value.strip()).strip()
+
+
+def _expand_value(raw: str) -> list[str] | None:
+    """Expand one serialized caps value into its discrete alternatives.
+
+    Handles both spellings this tool has seen in the wild — annotated
+    (``(int)640``) and bare (``640``) — and expands a list
+    (``{ (fraction)30/1, (fraction)15/1 }``) into one entry per member,
+    because a device that advertises a list really does support every rate
+    in it.
+
+    Returns ``None`` for a *range* (``[1, 640]``): a range is a continuum,
+    not an enumeration, and inventing discrete points inside it would be
+    exactly the silent guess this module refuses to make.
+    """
+    text = _strip_type(raw)
+    if text.startswith("["):
+        return None
+    if text.startswith("{"):
+        inner = text[1:-1] if text.endswith("}") else text[1:]
+        return [_strip_type(item) for item in _split_top_level(inner)]
+    return [text]
+
+
+def _caps_fields(rest: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for part in _split_top_level(rest):
+        key, separator, value = part.partition("=")
+        if separator:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def _ints(values: list[str] | None) -> list[int] | None:
+    if values is None:
+        return None
+    parsed = [int(value) for value in values if _INT_VALUE_RE.match(value)]
+    return parsed or None
+
+
+def _framerates(values: list[str] | None) -> list[float] | None:
+    if values is None:
+        return None
+    parsed: list[float] = []
+    for value in values:
+        matched = _FRACTION_VALUE_RE.match(value)
+        if matched is None:
+            continue
+        num, den = int(matched.group("num")), int(matched.group("den"))
+        if den == 0:
+            continue
+        parsed.append(round(num / den, 3))
+    return parsed or None
+
+
+def _pixel_formats(media: str, fields: dict[str, str]) -> list[str] | None:
+    if media == "image/jpeg":
+        return ["MJPG"]
+    if media != "video/x-raw":
+        return None
+    values = _expand_value(fields.get("format", ""))
+    if not values:
+        return None
+    return [_GST_TO_V4L2_FORMAT.get(value, value) for value in values if value]
+
+
+def _parse_caps_line(line: str) -> tuple[VideoFormat, ...]:
+    """Parse one ``gst-device-monitor-1.0`` caps line into zero or more formats.
+
+    One caps line can describe many concrete formats, because any field may
+    be list-valued; the result is the cross product of every field's discrete
+    alternatives. Defensive by design: a line this module does not recognise
+    (an unsupported media type, or any field given as a range rather than a
+    discrete value) yields an empty tuple rather than a guess — never a
+    crash, never a wrong answer.
     """
     media, _, rest = line.strip().partition(",")
     media = media.strip()
 
-    if media == "image/jpeg":
-        pixel_format = "MJPG"
-    elif media == "video/x-raw":
-        fmt_match = _RAW_FORMAT_RE.search(rest)
-        if fmt_match is None:
-            return None
-        gst_format = fmt_match.group(1)
-        pixel_format = _GST_TO_V4L2_FORMAT.get(gst_format, gst_format)
-    else:
-        return None
+    fields = _caps_fields(rest)
+    pixel_formats = _pixel_formats(media, fields)
+    if not pixel_formats:
+        return ()
 
-    width_match = _WIDTH_RE.search(rest)
-    height_match = _HEIGHT_RE.search(rest)
-    fps_match = _FRAMERATE_RE.search(rest)
-    if not (width_match and height_match and fps_match):
-        return None
+    widths = _ints(_expand_value(fields.get("width", "")))
+    heights = _ints(_expand_value(fields.get("height", "")))
+    rates = _framerates(_expand_value(fields.get("framerate", "")))
+    if not (widths and heights and rates):
+        return ()
 
-    num, den = int(fps_match.group(1)), int(fps_match.group(2))
-    if den == 0:
-        return None
-
-    return VideoFormat(
-        pixel_format=pixel_format,
-        width=int(width_match.group(1)),
-        height=int(height_match.group(1)),
-        fps=round(num / den, 3),
+    return tuple(
+        VideoFormat(pixel_format=pixel_format, width=width, height=height, fps=fps)
+        for pixel_format in pixel_formats
+        for width in widths
+        for height in heights
+        for fps in rates
     )
+
+
+def _device_paths(line: str) -> list[str]:
+    """Every ``/dev/...`` path a properties line claims for this device."""
+    matched = _PROPERTY_RE.match(line)
+    if matched is None or matched.group("key") not in _DEVICE_PATH_KEYS:
+        return []
+    value = _OBJECT_PATH_SCHEME_RE.sub("", matched.group("value").strip())
+    return [value] if value.startswith("/") else []
 
 
 def _parse_device_monitor_output(output: str, node_path: str) -> tuple[VideoFormat, ...]:
@@ -257,7 +435,7 @@ def _parse_device_monitor_output(output: str, node_path: str) -> tuple[VideoForm
     target = _normalize_path(node_path)
 
     for block in blocks:
-        device_path: str | None = None
+        device_paths: list[str] = []
         caps_lines: list[str] = []
         in_caps = False
 
@@ -279,24 +457,20 @@ def _parse_device_monitor_output(output: str, node_path: str) -> tuple[VideoForm
                     caps_lines.append(first)
                 continue
 
-            path_match = _DEVICE_PATH_RE.match(line)
-            if path_match:
-                device_path = path_match.group(1).strip()
+            device_paths.extend(_device_paths(line))
 
-        if device_path is None or _normalize_path(device_path) != target:
+        if not any(_normalize_path(path) == target for path in device_paths):
             continue
 
         formats: list[VideoFormat] = []
         seen: set[tuple[str, int, int, float]] = set()
         for caps_line in caps_lines:
-            parsed = _parse_caps_line(caps_line)
-            if parsed is None:
-                continue
-            key = (parsed.pixel_format, parsed.width, parsed.height, parsed.fps)
-            if key in seen:
-                continue
-            seen.add(key)
-            formats.append(parsed)
+            for parsed in _parse_caps_line(caps_line):
+                key = (parsed.pixel_format, parsed.width, parsed.height, parsed.fps)
+                if key in seen:
+                    continue
+                seen.add(key)
+                formats.append(parsed)
         return tuple(formats)
 
     return ()

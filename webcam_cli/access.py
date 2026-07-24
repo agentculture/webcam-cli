@@ -51,6 +51,7 @@ __all__ = [
     "AccessState",
     "Holder",
     "AccessReport",
+    "busy_error",
     "check_access",
     "require_access",
     "find_holder",
@@ -232,6 +233,34 @@ def require_access(path: str, kind: str) -> None:
     report = check_access(path, kind)
     if report.state is not AccessState.OK:
         raise access_error(report)
+
+
+def busy_error(path: str, kind: str) -> CliError:
+    """Build the typed BUSY error for ``path``, looking the holder up first.
+
+    For callers that learned the device is busy some way *other* than
+    ``open(2)``. That is not a corner case: **V4L2 exclusivity does not
+    surface on open at all**. uvcvideo lets several processes open the same
+    ``/dev/video*`` node and only refuses at ``S_FMT``/``STREAMON``, so
+    :func:`check_access` reports a camera another process is actively
+    streaming from as ``OK`` — verified on the reference host (task t9),
+    where the ALSA side of the *same* physical device correctly returned
+    ``EBUSY`` from ``open`` while the camera did not. A caller that sees
+    "device busy" in a capture engine's output uses this to produce exactly
+    the error :func:`require_access` would have produced had the kernel been
+    willing to tell it, holder and all.
+    """
+    _validate_kind(kind)
+    holder = find_holder(path)
+    return access_error(
+        AccessReport(
+            path=path,
+            kind=kind,
+            state=AccessState.BUSY,
+            remediation=_busy_remediation(kind, holder),
+            holder=holder,
+        )
+    )
 
 
 def _list_proc_pids() -> list[str]:

@@ -190,22 +190,29 @@ bounded by construction — and the two must not be blurred.
 
 ## Warm-up
 
-The first frames off a UVC sensor are dark while auto-exposure settles, so the
-pipeline runs for a warm-up interval *before* the attachment point is announced,
-with `tcpserversink` dropping buffers while no client is connected. Defaults:
-**30 frames** (~1 s at 30 fps) for video and av, **200 ms** for audio. Override
-with `--warmup-frames N` or `--warmup-ms MS`; `--warmup-frames 0` disables it.
+The first frames off a UVC sensor are unsettled while auto-exposure converges,
+so the pipeline runs for a warm-up interval *before* the attachment point is
+announced, with `tcpserversink` dropping buffers while no client is connected.
+Defaults: **30 frames** for video and av (converted through the negotiated fps
+— 1.0 s at 30 fps, 6.0 s at 5 fps) and **200 ms** for audio. Override with
+`--warmup-frames N` or `--warmup-ms MS`; `--warmup-frames 0` disables it.
+
+The frame count is measured, not guessed: on the reference C270 auto-exposure
+settled after 13-15 frames at 30 fps *and* at 5 fps, so settle tracks frames
+rather than wall-clock time, and a fixed-seconds default would under-warm at
+low frame rates. 30 is about 2x the slowest settle seen; that margin is
+deliberate and is not itself measured, since every run was under one indoor
+lighting condition. `webcam record` derives its default from the same constant,
+so the two verbs cannot drift apart.
 
 The guarantee is the announcement ordering, not an enforced gate: a consumer
 that connects before the announcement (by guessing the port) can still observe
 pre-settle frames.
 
-**Both defaults are provisional.** The reference host's C270 auto-exposure
-settle time has not been measured — measuring it needs hardware — so the video
-default is a conservative choice, not a finding. `webcam record` currently
-defaults to a *different* interval (2.0 s video, 0.0 s audio). The two have not
-been reconciled, and neither should be treated as authoritative until one is
-measured on hardware.
+What is *not* measured is the margin. Every settle run was under a single
+indoor lighting condition; a darker scene should be expected to converge more
+slowly, so 30 frames is a 2x cushion over what was observed rather than a
+characterization. Pass `--warmup-frames` if you know your conditions.
 
 ## Format negotiation
 
@@ -272,7 +279,8 @@ identity.
   probes for elements rather than assuming them.
 - `--port N` — loopback port (default 5000; `0` auto-picks a free one).
 - `--warmup-frames N` / `--warmup-ms MS` — sensor warm-up before the attachment
-  point is announced. Default 30 frames (~1 s at 30 fps), **provisional**;
+  point is announced. Default 30 frames, converted through the negotiated fps
+  (1.0 s at 30 fps, 6.0 s at 5 fps) and measured on the reference C270;
   `--warmup-frames 0` disables it.
 - `--probe`, `--apply`, `--json`.
 
@@ -416,14 +424,16 @@ versa) are refused rather than ignored.
 ## Warm-up
 
 `--warmup SECONDS` discards a pre-roll while auto-exposure settles, run as a
-separate first phase sunk to `fakesink`. Defaults: **2.0 s** for video and av,
-**0.0 s** for audio-only, since a microphone has no exposure to settle.
-`--warmup 0` is allowed — a pre-roll of zero is finite, unlike the recording
-bound.
+separate first phase sunk to `fakesink`. The default is **30 frames converted
+through the negotiated fps** — 1.0 s at 30 fps, 6.0 s at 5 fps — and **0.0 s**
+for audio-only, since a microphone has no exposure to settle. `--warmup 0` is
+allowed: a pre-roll of zero is finite, unlike the recording bound.
 
-**Provisional:** the C270's real settle time is unmeasured, and `webcam stream`
-defaults to a *different* interval (~30 frames, about 1 s). Neither number is
-authoritative yet, and they have not been reconciled.
+The frame count is measured on the reference C270 (13-15 frames to settle at
+30 fps *and* at 5 fps, so settle tracks frames rather than wall-clock time) and
+is the *same constant* `webcam stream` uses, so the two verbs cannot disagree
+as they did while both were guesses. `--json` reports `warmup_s`,
+`warmup_frames`, and `warmup_basis` for every run.
 
 ## Other flags
 

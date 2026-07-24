@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-24
+
+### Added
+
+- On-host acceptance for the a-v-streaming plan (task t9): `docs/acceptance-a-v-streaming.md` records what was run against the operator's Logitech C270, what was observed, and six findings. `scripts/acceptance/run.sh` re-runs it headless and non-interactively; `scripts/acceptance/blind-consumer.sh` is structurally blind — its only input is the payload file, it never runs `webcam`, never reads `/dev`, and is never told the device id — and exercises all four announced attachment forms plus a live instrumented decode; `scripts/acceptance/warmup-measure.py` reproduces the auto-exposure settle measurement. Every media artifact is written under `$TMPDIR` and deleted on exit, including on failure.
+- `engine.DEFAULT_WARMUP_FRAMES` — one measured constant backing both verbs' warm-up defaults, with the five cold-open runs recorded in its docstring — plus `engine.warmup_seconds()` and `engine.output_reports_device_busy()`.
+- `access.busy_error()` — builds the typed BUSY error, holder lookup included, for callers that learned a device was busy some way other than `open(2)`.
+- `record --json` reports `warmup_frames` and `warmup_basis` alongside `warmup_s`; `stream`'s `warmup.basis` replaces the former `warmup.provisional` field.
+
+### Fixed
+
+- **`--probe` and `--apply` were non-functional on any host running PipeWire** — that is, both `stream` and `record`, since every hardware path negotiates through `engine.probe_formats` first. PipeWire's device provider calls `gst_device_provider_hide_provider("v4l2deviceprovider")`, so its spelling is the only one `gst-device-monitor-1.0` emits, and it diverges from GStreamer's own in three independently fatal ways: no `device.path` property (the node path arrives as `api.v4l2.path` and `object.path = v4l2:/dev/videoN`), caps serialized without type annotations (`width=640`, not `width=(int)640`), and list-valued framerates (`framerate={ (fraction)30/1, ... }`). The parser now accepts every device-path key and both caps spellings, and expands list-valued fields into their discrete alternatives; ranges are still skipped rather than guessed at. The reference C270 now enumerates 198 formats where it previously enumerated none.
+- **No consumer could decode a `webcam stream av` attachment point at all.** The announced consumer command gave the demuxer's two branches no `queue`, so both ran from one streaming thread and the pipeline stalled: 0 video and 1 audio buffer reached a consumer over 8 seconds, with no error raised. Bisected on hardware against a known-good recorded file, which failed identically with the announced shape and yielded 40 video / 268 audio buffers with a `queue` per branch. Single-medium consumers have one branch and were never affected.
+- **A busy V4L2 camera did not produce the typed busy error.** uvcvideo permits several `open()`s of the same node and only refuses at `S_FMT`, so `access.check_access` reported a camera another process was actively streaming from as `ok`, while the same physical device's ALSA node correctly returned `EBUSY`. The failure surfaced as a generic "pipeline exited during warm-up" with the cause buried in an embedded gst-launch transcript. `stream` and `record` now recognise the engine's own wording and raise the typed busy error naming the holding process; measured at 1.36 s (video) and 0.31 s (audio) against a genuinely held C270.
+- **The activation log dropped the negotiated format, the applied warm-up and the pipeline pid from every `stream --apply` record.** `activation_scope` copies the detail mapping it is handed, and `stream` mutated its own local dict after entering the scope. For a consent record, "the camera was opened" without "in what format, for how long, by which process" is most of the value gone.
+
+### Changed
+
+- Warm-up defaults reconciled on a measured number, closing plan risk `r3`. `stream` used 30 frames and `record` a flat 2.0 s, and neither had been measured. Across five cold opens of the reference C270, auto-exposure settled in 12-15 *frames* whether the camera ran at 30 fps or at 5 fps, while the wall-clock interval ranged 0.40-3.00 s — settle tracks frame count, not time, so a fixed-seconds default is right at one frame rate and under-warms at every lower one. Both verbs now derive their default from `engine.DEFAULT_WARMUP_FRAMES` converted through the negotiated fps: `record`'s default becomes 1.0 s at 30 fps (was 2.0 s) and 6.0 s at 5 fps (was 2.0 s). The 2x margin over measured settle is deliberate and is *not* itself measured — all runs were in one room over one evening — and `README.md`, `learn`, both catalog entries and the `--json` payload say so rather than implying the number is authoritative.
+
 ## [0.7.0] - 2026-07-24
 
 ### Added
