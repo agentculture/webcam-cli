@@ -580,6 +580,58 @@ def _current_size(path: str) -> int:
         return 0
 
 
+def _start_phase_process(
+    argv: list[str], factory: Callable[..., subprocess.Popen]
+) -> subprocess.Popen:
+    """Launch the child, translating a failed exec into the typed env-error contract."""
+    try:
+        return factory(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as exc:
+        raise CliError(
+            EXIT_ENV_ERROR,
+            f"failed to start {argv[0]}: {exc}",
+            remediation=_INSTALL_HINT,
+        ) from exc
+
+
+def _bound_exceeded(
+    elapsed_s: float, deadline_s: float, max_bytes: int | None, output_path: str | None
+) -> str | None:
+    """Which cap — if any — has just been crossed: ``"size"``, ``"duration"``, or ``None``.
+
+    Size is checked first, matching the original single-function precedence:
+    a phase that is already over ``max_bytes`` the instant the deadline also
+    trips is still reported as a size stop.
+    """
+    size_hit = (
+        max_bytes is not None
+        and output_path is not None
+        and _current_size(output_path) >= max_bytes
+    )
+    if size_hit:
+        return "size"
+    if elapsed_s >= deadline_s:
+        return "duration"
+    return None
+
+
+def _terminate_phase(proc: subprocess.Popen, grace_s: float) -> tuple[str, str]:
+    """SIGINT the child (gst-launch-1.0's documented clean-stop signal), then SIGKILL.
+
+    Waits up to ``grace_s`` for the SIGINT to be honoured (EOS, finalize,
+    exit) before escalating. This is what keeps the bound holding even
+    against a child that ignores SIGINT outright: the wait here is itself
+    bounded, and the follow-up ``kill()`` cannot be ignored by the target
+    process.
+    """
+    proc.send_signal(signal.SIGINT)
+    try:
+        return proc.communicate(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.communicate()
+
+
 def _run_bounded_phase(
     argv: list[str],
     *,
@@ -597,30 +649,21 @@ def _run_bounded_phase(
     was chosen over ``splitmuxsink``'s internal size/time properties. The
     child is polled every ``poll_s``; the moment elapsed time reaches
     ``deadline_s``, or (when ``max_bytes`` is set) the file at
-    ``output_path`` reaches that size, SIGINT is sent (gst-launch-1.0's
-    documented clean-stop signal — sends EOS, finalizes the container, exits)
-    and given ``grace_s`` to comply before SIGKILL. This holds even if the
-    child never responds to SIGINT: the wall clock lives in this function,
-    not the child, so it always returns within ``deadline_s + grace_s``
-    (plus a bounded ``communicate()`` after the kill, which cannot be
-    ignored by the target process).
+    ``output_path`` reaches that size, :func:`_bound_exceeded` reports which
+    cap tripped and :func:`_terminate_phase` sends SIGINT, escalating to
+    SIGKILL after ``grace_s``. This holds even if the child never responds to
+    SIGINT: the wall clock lives in this function, not the child, so it
+    always returns within ``deadline_s + grace_s`` (plus a bounded
+    ``communicate()`` after the kill, which cannot be ignored by the target
+    process).
 
     ``popen_factory``/``clock`` default to :data:`subprocess.Popen`/
     :func:`time.monotonic`, looked up fresh on every call (not bound at
     import time) so tests can monkeypatch ``record.subprocess.Popen`` /
     ``record.time.monotonic`` directly, or inject fakes via the parameters.
     """
-    factory = popen_factory or subprocess.Popen
+    proc = _start_phase_process(argv, popen_factory or subprocess.Popen)
     now = clock or time.monotonic
-
-    try:
-        proc = factory(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except OSError as exc:
-        raise CliError(
-            EXIT_ENV_ERROR,
-            f"failed to start {argv[0]}: {exc}",
-            remediation=_INSTALL_HINT,
-        ) from exc
 
     start = now()
     reason = "completed"
@@ -630,21 +673,12 @@ def _run_bounded_phase(
             stdout, stderr = proc.communicate(timeout=poll_s)
             break
         except subprocess.TimeoutExpired:
-            elapsed = now() - start
-            size_hit = (
-                max_bytes is not None
-                and output_path is not None
-                and _current_size(output_path) >= max_bytes
-            )
-            if size_hit or elapsed >= deadline_s:
-                reason = "size" if size_hit else "duration"
-                proc.send_signal(signal.SIGINT)
-                try:
-                    stdout, stderr = proc.communicate(timeout=grace_s)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout, stderr = proc.communicate()
-                break
+            hit = _bound_exceeded(now() - start, deadline_s, max_bytes, output_path)
+            if hit is None:
+                continue
+            reason = hit
+            stdout, stderr = _terminate_phase(proc, grace_s)
+            break
 
     returncode = proc.returncode if proc.returncode is not None else -1
     return _PhaseResult(
@@ -819,6 +853,209 @@ def _dry_run(
 # ---------------------------------------------------------------------------
 
 
+def _require_access_for_kind(device: LogicalDevice, kind: str, capture_node: str | None) -> None:
+    """Raise the typed busy/forbidden error before any pipeline starts, not mid-recording."""
+    if kind in ("video", "av"):
+        access.require_access(capture_node, "video")
+    if kind in ("audio", "av"):
+        access.require_access(_audio_node_path(device.audio), "audio")
+
+
+def _negotiate_apply_formats(
+    kind: str,
+    capture_node: str | None,
+    requested_video: engine.VideoFormat | None,
+    requested_audio: engine.AudioFormat | None,
+) -> tuple[engine.VideoFormat | None, bool, engine.AudioFormat | None]:
+    """Negotiate the real formats ``--apply`` will record at.
+
+    Video is probed for real (unlike a plain dry-run) because ``--apply`` is
+    about to energize the device anyway. Returns
+    ``(negotiated_video, video_probed, negotiated_audio)``.
+    """
+    negotiated_video: engine.VideoFormat | None = None
+    video_probed = False
+    if kind in ("video", "av"):
+        available = engine.probe_formats(capture_node)
+        negotiated_video = engine.validate_negotiation(requested_video, available)
+        video_probed = True
+
+    negotiated_audio: engine.AudioFormat | None = None
+    if kind in ("audio", "av"):
+        negotiated_audio = requested_audio or engine.AudioFormat(
+            rate=_DEFAULT_AUDIO_RATE, channels=_DEFAULT_AUDIO_CHANNELS
+        )
+    return negotiated_video, video_probed, negotiated_audio
+
+
+@dataclass(frozen=True)
+class _RecordRun:
+    """What actually happened while running the (optional warm-up +) bounded record phase."""
+
+    record_argv: list[str]
+    result: _PhaseResult
+    started_at: str
+    warmup_started_at: str | None
+    recording_started_at: str
+    ended_at: str
+
+
+def _run_record_phases(
+    *,
+    kind: str,
+    capture_node: str | None,
+    negotiated_video: engine.VideoFormat | None,
+    audio_address: str | None,
+    negotiated_audio: engine.AudioFormat | None,
+    output_path: str,
+    warmup_s: float,
+    bound: Bound,
+    gst_launch: str | None,
+) -> _RecordRun:
+    """Build the pipeline(s), run the warm-up phase (if any), then the bounded recording."""
+    sink = f"filesink location={shlex.quote(output_path)}"
+    record_argv, warmup_argv = _build_pipelines(
+        kind, capture_node, negotiated_video, audio_address, negotiated_audio, sink, warmup_s
+    )
+    record_argv = _pin_executable(record_argv, gst_launch)
+    if warmup_argv is not None:
+        warmup_argv = _pin_executable(warmup_argv, gst_launch)
+
+    started_at = _now_iso()
+    warmup_started_at: str | None = None
+    if warmup_argv is not None:
+        warmup_started_at = _now_iso()
+        _run_bounded_phase(warmup_argv, deadline_s=warmup_s, max_bytes=None, output_path=None)
+
+    recording_started_at = _now_iso()
+    result = _run_bounded_phase(
+        record_argv,
+        deadline_s=bound.duration_s,
+        max_bytes=bound.max_bytes,
+        output_path=output_path,
+    )
+    ended_at = _now_iso()
+
+    return _RecordRun(
+        record_argv=record_argv,
+        result=result,
+        started_at=started_at,
+        warmup_started_at=warmup_started_at,
+        recording_started_at=recording_started_at,
+        ended_at=ended_at,
+    )
+
+
+def _apply_video_format_dict(
+    kind: str,
+    requested_video: engine.VideoFormat | None,
+    negotiated_video: engine.VideoFormat | None,
+    video_probed: bool,
+) -> dict[str, object] | None:
+    if kind not in ("video", "av"):
+        return None
+    return {
+        "requested": _video_fmt_dict(requested_video),
+        "negotiated": _video_fmt_dict(negotiated_video),
+        "probed": video_probed,
+    }
+
+
+def _apply_audio_format_dict(
+    kind: str,
+    requested_audio: engine.AudioFormat | None,
+    negotiated_audio: engine.AudioFormat | None,
+) -> dict[str, object] | None:
+    if kind not in ("audio", "av"):
+        return None
+    return {
+        "requested": _audio_fmt_dict(requested_audio),
+        "negotiated": _audio_fmt_dict(negotiated_audio),
+        "probed": False,
+    }
+
+
+def _apply_body(
+    act: activation.Activation,
+    *,
+    device: LogicalDevice,
+    kind: str,
+    capture_node: str | None,
+    audio_address: str | None,
+    requested_video: engine.VideoFormat | None,
+    requested_audio: engine.AudioFormat | None,
+    bound: Bound,
+    warmup: float | None,
+    output_path: str,
+) -> dict[str, object]:
+    """The activation-scoped body of ``record --apply``: negotiate, record, verify, report."""
+    cap = engine.require_engine()
+    _require_access_for_kind(device, kind, capture_node)
+
+    negotiated_video, video_probed, negotiated_audio = _negotiate_apply_formats(
+        kind, capture_node, requested_video, requested_audio
+    )
+    warmup_s = _resolve_warmup(warmup, kind, negotiated_video)
+
+    run = _run_record_phases(
+        kind=kind,
+        capture_node=capture_node,
+        negotiated_video=negotiated_video,
+        audio_address=audio_address,
+        negotiated_audio=negotiated_audio,
+        output_path=output_path,
+        warmup_s=warmup_s,
+        bound=bound,
+        gst_launch=cap.gst_launch,
+    )
+
+    size = _require_artifact(
+        output_path,
+        run.result,
+        busy_path=capture_node if kind in ("video", "av") else None,
+    )
+
+    act.detail.update(
+        {
+            "kind": kind,
+            "output_path": output_path,
+            "video_format": _video_fmt_dict(negotiated_video),
+            "audio_format": _audio_fmt_dict(negotiated_audio),
+            "bound": bound.as_dict(),
+            "warmup_s": warmup_s,
+            "bytes_written": size,
+            "stopped_reason": run.result.stopped_reason,
+        }
+    )
+
+    return {
+        "mode": "apply",
+        "apply": True,
+        "device": device.as_dict(),
+        "kind": kind,
+        "capture_node": capture_node,
+        "audio_address": audio_address,
+        "video_format": _apply_video_format_dict(
+            kind, requested_video, negotiated_video, video_probed
+        ),
+        "audio_format": _apply_audio_format_dict(kind, requested_audio, negotiated_audio),
+        "bound": bound.as_dict(),
+        "warmup_s": warmup_s,
+        "warmup_frames": _warmup_frames(warmup, kind, negotiated_video),
+        "warmup_basis": _WARMUP_BASIS,
+        "output_path": output_path,
+        "bytes_written": size,
+        "stopped_reason": run.result.stopped_reason,
+        "timestamps": {
+            "started_at": run.started_at,
+            "warmup_started_at": run.warmup_started_at,
+            "recording_started_at": run.recording_started_at,
+            "ended_at": run.ended_at,
+        },
+        "pipeline": run.record_argv,
+    }
+
+
 def _apply(
     *,
     device: LogicalDevice,
@@ -832,110 +1069,18 @@ def _apply(
     output_path: str,
 ) -> dict[str, object]:
     def _do(act: activation.Activation) -> dict[str, object]:
-        cap = engine.require_engine()
-
-        if kind in ("video", "av"):
-            access.require_access(capture_node, "video")
-        if kind in ("audio", "av"):
-            access.require_access(_audio_node_path(device.audio), "audio")
-
-        negotiated_video: engine.VideoFormat | None = None
-        video_probed = False
-        if kind in ("video", "av"):
-            available = engine.probe_formats(capture_node)
-            negotiated_video = engine.validate_negotiation(requested_video, available)
-            video_probed = True
-
-        negotiated_audio: engine.AudioFormat | None = None
-        if kind in ("audio", "av"):
-            negotiated_audio = requested_audio or engine.AudioFormat(
-                rate=_DEFAULT_AUDIO_RATE, channels=_DEFAULT_AUDIO_CHANNELS
-            )
-
-        warmup_s = _resolve_warmup(warmup, kind, negotiated_video)
-
-        sink = f"filesink location={shlex.quote(output_path)}"
-        record_argv, warmup_argv = _build_pipelines(
-            kind, capture_node, negotiated_video, audio_address, negotiated_audio, sink, warmup_s
-        )
-        record_argv = _pin_executable(record_argv, cap.gst_launch)
-        if warmup_argv is not None:
-            warmup_argv = _pin_executable(warmup_argv, cap.gst_launch)
-
-        started_at = _now_iso()
-        warmup_started_at: str | None = None
-        if warmup_argv is not None:
-            warmup_started_at = _now_iso()
-            _run_bounded_phase(warmup_argv, deadline_s=warmup_s, max_bytes=None, output_path=None)
-
-        recording_started_at = _now_iso()
-        result = _run_bounded_phase(
-            record_argv,
-            deadline_s=bound.duration_s,
-            max_bytes=bound.max_bytes,
+        return _apply_body(
+            act,
+            device=device,
+            kind=kind,
+            capture_node=capture_node,
+            audio_address=audio_address,
+            requested_video=requested_video,
+            requested_audio=requested_audio,
+            bound=bound,
+            warmup=warmup,
             output_path=output_path,
         )
-        ended_at = _now_iso()
-
-        size = _require_artifact(
-            output_path,
-            result,
-            busy_path=capture_node if kind in ("video", "av") else None,
-        )
-
-        act.detail.update(
-            {
-                "kind": kind,
-                "output_path": output_path,
-                "video_format": _video_fmt_dict(negotiated_video),
-                "audio_format": _audio_fmt_dict(negotiated_audio),
-                "bound": bound.as_dict(),
-                "warmup_s": warmup_s,
-                "bytes_written": size,
-                "stopped_reason": result.stopped_reason,
-            }
-        )
-
-        return {
-            "mode": "apply",
-            "apply": True,
-            "device": device.as_dict(),
-            "kind": kind,
-            "capture_node": capture_node,
-            "audio_address": audio_address,
-            "video_format": (
-                {
-                    "requested": _video_fmt_dict(requested_video),
-                    "negotiated": _video_fmt_dict(negotiated_video),
-                    "probed": video_probed,
-                }
-                if kind in ("video", "av")
-                else None
-            ),
-            "audio_format": (
-                {
-                    "requested": _audio_fmt_dict(requested_audio),
-                    "negotiated": _audio_fmt_dict(negotiated_audio),
-                    "probed": False,
-                }
-                if kind in ("audio", "av")
-                else None
-            ),
-            "bound": bound.as_dict(),
-            "warmup_s": warmup_s,
-            "warmup_frames": _warmup_frames(warmup, kind, negotiated_video),
-            "warmup_basis": _WARMUP_BASIS,
-            "output_path": output_path,
-            "bytes_written": size,
-            "stopped_reason": result.stopped_reason,
-            "timestamps": {
-                "started_at": started_at,
-                "warmup_started_at": warmup_started_at,
-                "recording_started_at": recording_started_at,
-                "ended_at": ended_at,
-            },
-            "pipeline": record_argv,
-        }
 
     return _with_activation(
         device, target=output_path, detail={"action": "record", "kind": kind}, body=_do
