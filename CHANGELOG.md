@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-24
+
+### Added
+
+- CLAUDE.md expanded from the bootstrap seed into a full runtime prompt for the webcam-cli domain, grounded in the issue #1 build brief and a re-survey of the operator's host: the capture lane and its out-of-lane siblings, the six-verb scaffold's architecture (the four places a new verb must touch, the parser_class threading that keeps nested nouns on the structured error contract, the double --json sniff, the CWD-independent identity walk), the device-identity and permission constraints, the six open design questions that most constrain code shape, and the repo conventions recovered from the pre-scaffold template (version-bump-every-PR, the cicd lane, worktree layout, memory discipline, ask-colleague reflex).
+
+### Changed
+
+- README.md rewritten from template-clone instructions to an agent description: adds a Status section stating plainly that the capture surface is not implemented yet, a Scope section naming what belongs to sibling agents, a planned-verb table alongside today's baseline, and a section on why device identity is the hard part. Drops the 'Make it your own' clone checklist, which described renaming a template this repo already is.
+
+### Fixed
+
+- README quickstart invoked `uv run webcam-cli whoami` / `learn`, which fails with 'Failed to spawn' — `[project.scripts]` installs the console command as `webcam`, not `webcam-cli`. Corrected to `webcam`, and the deliberate command/package/dist name split is now stated explicitly. The same mismatch inside the CLI's own self-description (argparse `prog="webcam-cli"`, so `--help`, every error hint, `learn`, and the whole `explain` catalog point agents at a command that is not installed) is documented in CLAUDE.md as an open defect rather than fixed here, since it changes agent-visible output under the rubric gate.
+
 ## [0.6.1] - 2026-07-20
 
 ### Added
