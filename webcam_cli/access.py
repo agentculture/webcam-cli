@@ -280,6 +280,44 @@ def _read_command(pid: str) -> str:
         return handle.read().strip()
 
 
+def _holder_from_fd(entry: str, fd_name: str, target: str) -> Holder | None:
+    """Check one ``/proc/<entry>/fd/<fd_name>`` entry against ``target``.
+
+    Returns the :class:`Holder` if this descriptor is the one holding
+    ``target`` open, else ``None`` — including when the symlink cannot be
+    read at all (a race on a closing fd, a dangling entry).
+    """
+    try:
+        link = _readlink(f"/proc/{entry}/fd/{fd_name}")
+    except OSError:
+        return None
+    if link != target:
+        return None
+    try:
+        command = _read_command(entry)
+    except OSError:
+        command = "unknown"
+    return Holder(pid=int(entry), command=command)
+
+
+def _holder_in_pid(entry: str, target: str) -> Holder | None:
+    """Scan every open fd of one pid for ``target``, degrading to ``None``.
+
+    A pid's ``fd`` directory can be unreadable (owned by another user, the
+    common case) or the pid can exit mid-scan — either way this is not ours
+    to read, so it is skipped rather than guessed at.
+    """
+    try:
+        fd_names = _list_fds(entry)
+    except OSError:
+        return None
+    for fd_name in fd_names:
+        holder = _holder_from_fd(entry, fd_name, target)
+        if holder is not None:
+            return holder
+    return None
+
+
 def find_holder(path: str) -> Holder | None:
     """Best-effort, bounded scan of ``/proc/*/fd`` for a process with ``path`` open.
 
@@ -307,23 +345,9 @@ def find_holder(path: str) -> Holder | None:
     for entry in pids:
         if not entry.isdigit():
             continue
-        try:
-            fd_names = _list_fds(entry)
-        except OSError:
-            # Not ours to read, or the process is already gone — skip it,
-            # don't guess.
-            continue
-        for fd_name in fd_names:
-            try:
-                link = _readlink(f"/proc/{entry}/fd/{fd_name}")
-            except OSError:
-                continue
-            if link == target:
-                try:
-                    command = _read_command(entry)
-                except OSError:
-                    command = "unknown"
-                return Holder(pid=int(entry), command=command)
+        holder = _holder_in_pid(entry, target)
+        if holder is not None:
+            return holder
     return None
 
 

@@ -33,6 +33,7 @@ Four trees, all derived from the operator's host on 2026-07-24:
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -330,9 +331,10 @@ def test_resolve_rejects_an_unknown_dev_video_index() -> None:
 
 
 def test_resolve_on_an_empty_tree_still_fails_cleanly(tmp_path: Path) -> None:
-    assert enumerate_devices(root=str(tmp_path)) == ()
+    root = str(tmp_path)
+    assert enumerate_devices(root=root) == ()
     with pytest.raises(CliError) as excinfo:
-        resolve("C270", root=str(tmp_path))
+        resolve("C270", root=root)
     assert excinfo.value.code == EXIT_USER_ERROR
 
 
@@ -343,9 +345,9 @@ def test_resolve_on_an_empty_tree_still_fails_cleanly(tmp_path: Path) -> None:
 
 def test_value_objects_are_frozen() -> None:
     device = resolve("C270", root=BASELINE)
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         device.stable_id = "nope"  # type: ignore[misc]
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         device.video_nodes[0].path = "nope"  # type: ignore[misc]
 
 

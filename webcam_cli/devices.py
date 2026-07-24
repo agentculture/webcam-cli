@@ -74,7 +74,12 @@ _BY_ID_NAME_RE = re.compile(r"^(?P<stable>.+)-video-index(?P<index>\d+)$")
 # root hubs ("usb3") and platform nodes ("NVDA8000:01") deliberately do not match.
 _USB_DEVICE_RE = re.compile(r"^\d+-\d+(?:\.\d+)*$")
 # " 1 [WEBCAM         ]: USB-Audio - C270 HD WEBCAM"
-_CARDS_LINE_RE = re.compile(r"^\s*(?P<index>\d+)\s*\[(?P<id>[^\]]*?)\s*\]\s*:\s*(?P<rest>.*)$")
+# ALSA card ids never contain whitespace (the kernel restricts them to
+# alnum/underscore), so the id group excludes \s explicitly rather than
+# lazily backing off past it — [^\]]*? followed by \s* let both quantifiers
+# claim the same run of trailing spaces, which is quadratic backtracking on
+# a line that never finds a closing ']'.
+_CARDS_LINE_RE = re.compile(r"^\s*(?P<index>\d+)\s*\[(?P<id>[^\]\s]*)\s*\]\s*:\s*(?P<rest>.*)$")
 # A capture PCM directory under /proc/asound/cardN: "pcm0c" (playback is "pcm0p").
 _CAPTURE_PCM_RE = re.compile(r"^pcm(?P<device>\d+)c$")
 # udev's device-name allowlist; everything else becomes "_".
