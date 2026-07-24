@@ -206,7 +206,7 @@ def detect() -> Capability:
     if gst_inspect is not None:
         plugins = {element: _element_present(gst_inspect, element) for element in _ALL_ELEMENTS}
     else:
-        plugins = {element: False for element in _ALL_ELEMENTS}
+        plugins = dict.fromkeys(_ALL_ELEMENTS, False)
 
     core_present = all(plugins[element] for element in _CORE_ELEMENTS)
     available = gst_launch is not None and core_present
@@ -266,9 +266,21 @@ def require_engine() -> Capability:
 # --- format probing -----------------------------------------------------------
 
 _DEVICE_BLOCK_SPLIT_RE = re.compile(r"(?m)^Device found:\s*$")
-_CAPS_HEADER_RE = re.compile(r"^\s*caps\s*:\s*(.*)$")
+
+# Trailing content is captured without a second `\s*` glued to it: `\s*`
+# immediately followed by `(.*)` (or `.+`) is two quantifiers over
+# overlapping character classes (`.` matches whitespace too), which is the
+# super-linear-backtracking shape python:S8786 flags. Both callers already
+# `.strip()` the piece they pull out, so dropping the redundant trailing
+# `\s*` changes nothing about what ends up in `caps_lines` / property values
+# — only how deterministically the regex engine gets there.
+_CAPS_HEADER_RE = re.compile(r"^\s*caps\s*:(.*)$")
 _PROPERTIES_HEADER_RE = re.compile(r"^\s*properties\s*:\s*$")
-_PROPERTY_RE = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.\-]+)\s*=\s*(?P<value>.+?)\s*$")
+
+# Matches only the `key =` prefix of a properties line; the value is
+# whatever text follows the match (see `_device_paths`), sliced in plain
+# Python rather than captured by a second, overlapping-quantifier group.
+_PROPERTY_RE = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.\-]+)\s*=\s*")
 
 # Property keys that can carry the device's ``/dev/videoN`` path. Which of
 # them appear depends on *which device provider* answered, and that is not a
@@ -426,52 +438,86 @@ def _device_paths(line: str) -> list[str]:
     matched = _PROPERTY_RE.match(line)
     if matched is None or matched.group("key") not in _DEVICE_PATH_KEYS:
         return []
-    value = _OBJECT_PATH_SCHEME_RE.sub("", matched.group("value").strip())
+    raw_value = line[matched.end() :].strip()
+    value = _OBJECT_PATH_SCHEME_RE.sub("", raw_value)
     return [value] if value.startswith("/") else []
 
 
+def _classify_block_line(line: str, in_caps: bool) -> tuple[bool, str | None, str | None]:
+    """Decide what one transcript line means, given the current caps-section state.
+
+    A device block is a tiny state machine: outside a caps section, a line
+    either opens one (``caps  : ...``) or is a candidate properties line;
+    inside one, a line either closes it (``properties:``) or is a
+    continuation of the caps listing. Returns
+    ``(next_in_caps, caps_text, device_path_line)``:
+
+    * ``caps_text`` is a non-empty caps fragment to record, or ``None``.
+    * ``device_path_line`` is the raw line to scan for a device path
+      property, or ``None`` when this line was consumed as caps text or a
+      section boundary instead.
+    """
+    if in_caps:
+        if _PROPERTIES_HEADER_RE.match(line):
+            return False, None, None
+        stripped = line.strip()
+        return True, (stripped or None), None
+
+    caps_match = _CAPS_HEADER_RE.match(line)
+    if caps_match:
+        first = caps_match.group(1).strip()
+        return True, (first or None), None
+
+    return False, None, line
+
+
+def _parse_device_block(block: str) -> tuple[list[str], list[str]]:
+    """Split one "Device found:" block into its device-path and caps lines."""
+    device_paths: list[str] = []
+    caps_lines: list[str] = []
+    in_caps = False
+
+    for line in block.splitlines():
+        in_caps, caps_text, path_line = _classify_block_line(line, in_caps)
+        if caps_text is not None:
+            caps_lines.append(caps_text)
+        if path_line is not None:
+            device_paths.extend(_device_paths(path_line))
+
+    return device_paths, caps_lines
+
+
+def _dedup_formats(caps_lines: Sequence[str]) -> tuple[VideoFormat, ...]:
+    """Parse every caps line and drop duplicate (format, geometry, fps) entries."""
+    formats: list[VideoFormat] = []
+    seen: set[tuple[str, int, int, float]] = set()
+    for caps_line in caps_lines:
+        for parsed in _parse_caps_line(caps_line):
+            key = (parsed.pixel_format, parsed.width, parsed.height, parsed.fps)
+            if key in seen:
+                continue
+            seen.add(key)
+            formats.append(parsed)
+    return tuple(formats)
+
+
 def _parse_device_monitor_output(output: str, node_path: str) -> tuple[VideoFormat, ...]:
+    """Find the block matching ``node_path`` and return its parsed formats.
+
+    Splits ``output`` on "Device found:" headers, then for each block checks
+    whether any of its device-path properties resolve to ``node_path`` (see
+    :func:`_parse_device_block`, :func:`_device_paths`). The first matching
+    block's caps lines are parsed and de-duplicated (:func:`_dedup_formats`).
+    Returns an empty tuple when no block matches.
+    """
     blocks = _DEVICE_BLOCK_SPLIT_RE.split(output)[1:]
     target = _normalize_path(node_path)
 
     for block in blocks:
-        device_paths: list[str] = []
-        caps_lines: list[str] = []
-        in_caps = False
-
-        for line in block.splitlines():
-            if in_caps:
-                if _PROPERTIES_HEADER_RE.match(line):
-                    in_caps = False
-                    continue
-                stripped = line.strip()
-                if stripped:
-                    caps_lines.append(stripped)
-                continue
-
-            caps_match = _CAPS_HEADER_RE.match(line)
-            if caps_match:
-                in_caps = True
-                first = caps_match.group(1).strip()
-                if first:
-                    caps_lines.append(first)
-                continue
-
-            device_paths.extend(_device_paths(line))
-
+        device_paths, caps_lines = _parse_device_block(block)
         if not any(_normalize_path(path) == target for path in device_paths):
             continue
-
-        formats: list[VideoFormat] = []
-        seen: set[tuple[str, int, int, float]] = set()
-        for caps_line in caps_lines:
-            for parsed in _parse_caps_line(caps_line):
-                key = (parsed.pixel_format, parsed.width, parsed.height, parsed.fps)
-                if key in seen:
-                    continue
-                seen.add(key)
-                formats.append(parsed)
-        return tuple(formats)
+        return _dedup_formats(caps_lines)
 
     return ()
 
