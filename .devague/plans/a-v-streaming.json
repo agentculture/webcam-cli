@@ -1,0 +1,414 @@
+{
+  "slug": "a-v-streaming",
+  "title": "a/v streaming",
+  "frame_slug": "a-v-streaming",
+  "schema_version": 3,
+  "status": "exported",
+  "created": "2026-07-24T16:23:13Z",
+  "updated": "2026-07-24T16:27:42Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "webcam-cli streams live video, live microphone audio, and combined muxed A/V from attached USB capture devices, addressed by stable id, under the same agent-first JSON/error contract as the planned capture verbs"
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "on this host, a separate process attaches to a C270 video-plus-mic stream and decodes live media end-to-end"
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "stream verbs address devices by stable identity (/dev/v4l/by-id path, ALSA card longname/serial), never bare index \u2014 on this host the C270/Arducam video nodes and ALSA cards have already swapped since the brief was written"
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "a stream request keyed by stable id still resolves correctly after an unplug/replug renumbers /dev/videoN and the ALSA card"
+    },
+    {
+      "id": "c3",
+      "kind": "requirement",
+      "text": "stream --json is complete enough that a consumer never re-derives: resolved stable identity, negotiated (format, resolution, fps) actually granted vs requested, delivery target, start timestamp \u2014 Q6 validation against the enumerated set, no silent fallback"
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "a test consumer reconstructs device, negotiated format, and attachment target from the --json payload alone, with no host inspection"
+    },
+    {
+      "id": "c5",
+      "kind": "boundary",
+      "text": "streaming adds no runtime Python dependency \u2014 dependencies = [] in pyproject.toml stays empty (Q2 posture, shell-cli precedent); bandit config already skips B404/B603, so a subprocess engine is lint-accommodated"
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "the built wheel declares zero runtime dependencies after streaming lands (dependencies = [] unchanged in the PR diff)"
+    },
+    {
+      "id": "c7",
+      "kind": "requirement",
+      "text": "stream verbs fail fast with a typed device-busy error naming the holder when determinable, never hang \u2014 and a running stream itself holds exclusive access for its whole lifetime, which its metadata must state"
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "opening the C270 while another process holds it returns the typed busy error within a bounded time \u2014 never hangs \u2014 naming the holder when determinable"
+    },
+    {
+      "id": "c8",
+      "kind": "requirement",
+      "text": "device enumeration and stream-open errors distinguish absent from present-but-forbidden and name the per-subsystem fix: video nodes ride the logind seat ACL (headless/container/systemd loses them), audio nodes ride audio group membership (survives headless here)"
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "with the seat ACL absent (headless simulation) the error names the ACL/group fix; with the node absent it reports absent; the two are never conflated"
+    },
+    {
+      "id": "c9",
+      "kind": "boundary",
+      "text": "the template contracts survive streaming unchanged: results to stdout and diagnostics to stderr never mixed, every verb takes --json, failures are CliError with hint: and exit codes 0/1/2, no traceback ever reaches stderr"
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "the rubric gate still passes with streaming verbs present: success stdout carries only the result, every failure exits 1 or 2 with error:+hint: (or the JSON triple), and no traceback appears in any new-verb test"
+    },
+    {
+      "id": "c10",
+      "kind": "requirement",
+      "text": "each stream verb lands in all four hand-maintained surface points (command module with register(), the _build_parser call, an explain catalog entry, overview._VERBS plus the learn command map), nests with parser_class=type(p), and passes teken cli doctor --strict"
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "teken cli doctor --strict passes with the new verbs registered in all four hand-maintained surface points"
+    },
+    {
+      "id": "c11",
+      "kind": "requirement",
+      "text": "the first streaming PR rewrites the agent-facing self-description in the same change: the learn text, explain catalog and overview artifact list still call this repo a clonable template, and prog plus every doc string say webcam-cli although the installed command is webcam"
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "after the first streaming PR, learn/explain/overview contain no template prose and every documented invocation uses the installed command name webcam"
+    },
+    {
+      "id": "c13",
+      "kind": "requirement",
+      "text": "combined A/V streaming pairs camera and mic through USB topology (shared sysfs USB parent), never index correlation; on this host the C270 video nodes and its ALSA card share USB device 3-1 and the by-id/serial handles agree"
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "pairing is derived from sysfs USB topology and matches the C270 camera to its own microphone on this host"
+    },
+    {
+      "id": "c15",
+      "kind": "requirement",
+      "text": "every stream activation is loggable and writes only to the named target with no hidden buffer; the tool states plainly that it cannot promise a hardware activity light (device firmware) and never implies it prevents covert use"
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "every stream and record activation appends a log entry, and no bytes land anywhere except the named target or announced buffer"
+    },
+    {
+      "id": "c19",
+      "kind": "audience",
+      "text": "mesh agents and follow-on tools are the primary consumers \u2014 a vision model attaching to a video buffer, a voice pipeline consuming mic audio, events-cli announcing activations \u2014 with the human operator second, for debugging and consent oversight"
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "the --json payloads are exercised in tests by a headless script with no TTY and no human \u2014 proving the primary agent audience can operate the surface blind"
+    },
+    {
+      "id": "c20",
+      "kind": "after_state",
+      "text": "an agent can enumerate devices by stable id, attach to a live video / audio / combined-A-V stream buffer, or request a bounded recording \u2014 and everything needed to consume the stream (attachment endpoint, negotiated format, pairing, timestamps) is in the --json payload, no host inspection required"
+    },
+    {
+      "id": "h15",
+      "kind": "honesty",
+      "text": "on this host, list -> stream -> attach and list -> record each complete using only stable ids and --json output, with no manual host inspection between steps"
+    },
+    {
+      "id": "c21",
+      "kind": "before_state",
+      "text": "webcam_cli contains no capture code at all \u2014 six template verbs and prose that still calls the repo a clonable template; there is no way to get frames or samples off the attached devices through this tool"
+    },
+    {
+      "id": "h16",
+      "kind": "honesty",
+      "text": "main today contains no capture or stream code \u2014 only the six template verbs \u2014 so the before-state is verifiable in git history at the moment the spec lands"
+    },
+    {
+      "id": "c22",
+      "kind": "why_it_matters",
+      "text": "streaming turns the cameras and mics from one-shot artifact producers into live sensors the mesh can actually use \u2014 realtime vision and voice \u2014 while keeping the honest-metadata, consent-logged posture the brief demands"
+    },
+    {
+      "id": "h17",
+      "kind": "honesty",
+      "text": "a live consumer demo exists: frames and samples reach a second process while the stream is running, not merely a file inspected after the fact"
+    },
+    {
+      "id": "c23",
+      "kind": "success_signal",
+      "text": "a consumer process that has never inspected this host starts a stream and decodes live media using only the --json payload; record produces a bounded, well-formed artifact; teken cli doctor --strict and the full CI matrix stay green"
+    },
+    {
+      "id": "h18",
+      "kind": "honesty",
+      "text": "the success signal is executable: a documented acceptance script (or CI job) performs the blind consumer attach and a bounded record, and teken cli doctor --strict plus pytest stay green"
+    },
+    {
+      "id": "c24",
+      "kind": "requirement",
+      "text": "video and combined-A-V stream buffers are exposed through a GStreamer-served local attachment point (shared-memory or local-socket sink) that a separate process attaches to using only what --json announced"
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "a second process, given only the announced attachment point, attaches and receives decodable frames"
+    },
+    {
+      "id": "c27",
+      "kind": "boundary",
+      "text": "this feature targets only the Logitech webcam with its onboard mic (C270); Reachy Mini Audio is out of scope, the Arducam is not a target"
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "acceptance tests exercise only the C270 by its stable id; Reachy Mini Audio and Arducam appear only in enumeration or negative tests"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Device identity core: enumerate logical devices from /dev/v4l/by-id + /sys USB topology + /proc/asound, collapse multi-node UVC devices, pair camera to mic via shared USB parent, resolve by stable id",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "logical device list collapses the C270's two video nodes into one entry keyed by its /dev/v4l/by-id handle with serial",
+        "camera-to-mic pairing is derived from the shared sysfs USB parent and matches the C270 camera to its own mic on a fixture of this host's sysfs tree",
+        "resolution by stable id is index-independent: a fixture that renumbers videoN and ALSA cards still resolves the same logical device"
+      ],
+      "deps": [],
+      "covers": [
+        "c2",
+        "h2",
+        "c13",
+        "h8"
+      ],
+      "instruction": ""
+    },
+    {
+      "id": "t2",
+      "summary": "Typed device-access errors: busy (naming the holder via /proc scan when determinable), absent vs present-but-forbidden with per-subsystem fix naming, within the CliError contract",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "opening a busy device raises a typed CliError naming the holder pid/command when determinable, within a bounded time, never hangs (tested against a deliberately-held device)",
+        "absent node yields an absent error; present-but-EACCES yields a forbidden error naming the seat-ACL/video-group fix for video and the audio-group fix for ALSA; the two are never conflated (unit-tested via fake fs)"
+      ],
+      "deps": [],
+      "covers": [
+        "c7",
+        "h4",
+        "c8",
+        "h5"
+      ],
+      "instruction": ""
+    },
+    {
+      "id": "t3",
+      "summary": "GStreamer engine adapter: capability detection (gst-launch-1.0 + plugin probe via gst-inspect-1.0), pipeline construction for v4l2src / alsasrc / muxed A-V, typed exit-2 install hint when absent \u2014 zero runtime deps",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "engine detects gst-launch-1.0 and required plugins and reports the capability set; when absent, a typed exit-2 error carries an install hint",
+        "pipeline builder emits valid gst-launch pipeline strings for video (v4l2src), audio (alsasrc with hw:CARD address), and muxed A-V (matroskamux)",
+        "pyproject dependencies = [] is unchanged by the PR"
+      ],
+      "deps": [],
+      "covers": [
+        "c5",
+        "h11"
+      ],
+      "instruction": ""
+    },
+    {
+      "id": "t4",
+      "summary": "Activation log: append-only JSONL of every stream/record activation (device stable id, verb, target, timestamps, pid), location documented and echoed in --json",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "every activation appends exactly one JSON line with device stable id, verb, named target, start/end timestamps and pid",
+        "no bytes are written anywhere except the named target/buffer and the activation log (asserted by the artifact tests)"
+      ],
+      "deps": [],
+      "covers": [
+        "c15",
+        "h9"
+      ],
+      "instruction": ""
+    },
+    {
+      "id": "t5",
+      "summary": "webcam list verb: logical devices with stable id, nodes, ALSA card, paired mic, and access status (ok / absent / forbidden-with-fix) in text and --json",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "webcam list --json emits logical devices with stable id, device nodes, ALSA card, paired mic, and per-device access status including the named fix when forbidden",
+        "list exits 0 with a valid empty result when no devices are attached; stderr is silent on success"
+      ],
+      "deps": [
+        "t1",
+        "t2"
+      ],
+      "covers": [],
+      "instruction": ""
+    },
+    {
+      "id": "t6",
+      "summary": "webcam stream verb group (video / audio / av): dry-run by default resolving device + negotiation and printing the attachment plan; --apply exposes an unbounded GStreamer-served local attachment point with warm-up, honest negotiated-vs-requested reporting, and activation logging",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "dry-run (default) resolves the device, validates the requested (format, resolution, fps) against the enumerated set, and prints the attachment plan without opening the device",
+        "with --apply, a second process attaches using only the --json payload and receives decodable frames (integration test)",
+        "negotiated-vs-requested is reported; an unsupported combination is a typed user error, never a silent fallback",
+        "warm-up discard is applied at stream start, with a documented, overridable default"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3",
+        "t4"
+      ],
+      "covers": [
+        "c3",
+        "h3",
+        "c24",
+        "h10"
+      ],
+      "instruction": ""
+    },
+    {
+      "id": "t7",
+      "summary": "webcam record verb: bounded-by-construction clip/audio recording \u2014 duration and/or size cap enforced with a default, unbounded not expressible; dry-run default, --apply writes one artifact at the named path with full --json metadata",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "record enforces a bound: default cap applied when none given, and an unbounded recording is not expressible via any flag combination",
+        "record --apply writes exactly one artifact at the named path; --json reports negotiated format, the enforced bound, output path, and timestamps",
+        "dry-run resolves and validates without energizing hardware"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3",
+        "t4"
+      ],
+      "covers": [],
+      "instruction": ""
+    },
+    {
+      "id": "t8",
+      "summary": "Surface wiring + self-description rewrite: register list/stream/record in all four hand-maintained points, fix prog to webcam, purge template prose from learn/explain/overview, keep the rubric green",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "all three verbs are registered in the command module, _build_parser, the explain catalog (test_every_catalog_path_resolves passes) and overview._VERBS plus the learn map",
+        "prog is webcam; no doc string, catalog entry or learn text references webcam-cli as a typable command, and no template prose remains in learn/explain/overview",
+        "teken cli doctor --strict passes and noun groups use parser_class so parse errors keep the structured exit-1 contract"
+      ],
+      "deps": [
+        "t5",
+        "t6",
+        "t7"
+      ],
+      "covers": [
+        "c9",
+        "h13",
+        "c10",
+        "h6",
+        "c11",
+        "h7"
+      ],
+      "instruction": ""
+    },
+    {
+      "id": "t9",
+      "summary": "On-host acceptance: documented script proving the blind-consumer contract on the C270 \u2014 list to stream to attach and list to record from stable ids + JSON alone, live second-process decode, busy-device probe, before-state cited from git history",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a documented acceptance script, run headless with no TTY, attaches a consumer from the --json payload alone and decodes live video and audio from the C270 while the stream runs",
+        "the script exercises list-then-stream-then-attach and list-then-record using only stable ids and JSON output, with no manual host inspection between steps",
+        "a second open of the held C270 returns the typed busy error within a bounded time during the live run",
+        "the acceptance doc cites the pre-streaming main commit as the before-state, targets only the C270 stable id, and the run ends with pytest -n auto and teken cli doctor --strict green"
+      ],
+      "deps": [
+        "t8"
+      ],
+      "covers": [
+        "c1",
+        "h1",
+        "c19",
+        "h14",
+        "c20",
+        "h15",
+        "c21",
+        "h16",
+        "c22",
+        "h17",
+        "c23",
+        "h18",
+        "c27",
+        "h12"
+      ],
+      "instruction": ""
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "attachment-point mechanism inside GStreamer (shmsink shared memory vs local socket sink) is decided during the stream task against consumer ergonomics \u2014 both are GStreamer-native and satisfy c24",
+      "kind": "unknown_nonblocking",
+      "task_id": "t6",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r2",
+      "text": "holder identification for busy devices scans /proc/*/fd, which may be permission-limited for other users' processes \u2014 the busy error must degrade gracefully to holder-unknown",
+      "kind": "unknown_nonblocking",
+      "task_id": "t2",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r3",
+      "text": "C270 auto-exposure settle time is unmeasured \u2014 the warm-up default needs empirical tuning on this host during the stream task",
+      "kind": "unknown_nonblocking",
+      "task_id": "t6",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r4",
+      "text": "parked follow-ups ride behind this plan: WebSocket audio endpoint layered on the buffer, and events-cli activation announcements (frame parks v2/v3) \u2014 neither blocks iteration 1",
+      "kind": "follow_up",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    }
+  ]
+}
