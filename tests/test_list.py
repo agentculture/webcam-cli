@@ -403,6 +403,41 @@ def test_text_mode_flags_capture_node_as_a_heuristic(
     assert "heuristic" in text.lower()
 
 
+def test_text_mode_reports_no_audio_for_a_camera_only_device(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(list_devices, "check_access", _always_ok)
+
+    exit_code = _invoke(["list", "--root", CAMERA_ONLY])
+    assert exit_code == 0
+    text = capsys.readouterr().out
+
+    assert "audio: none" in text
+
+
+def test_text_mode_shows_the_hint_line_for_forbidden_audio(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake(path: str, kind: str) -> AccessReport:
+        if kind == "audio":
+            return AccessReport(
+                path=path,
+                kind="audio",
+                state=AccessState.FORBIDDEN,
+                remediation="add the invoking user to the 'audio' group",
+            )
+        return _always_ok(path, kind)
+
+    monkeypatch.setattr(list_devices, "check_access", fake)
+
+    exit_code = _invoke(["list", "--root", BASELINE])
+    assert exit_code == 0
+    text = capsys.readouterr().out
+
+    assert "audio access: forbidden" in text
+    assert "hint: add the invoking user to the 'audio' group" in text
+
+
 # ---------------------------------------------------------------------------
 # _audio_node_path: the /dev/snd path reconstruction
 # ---------------------------------------------------------------------------
