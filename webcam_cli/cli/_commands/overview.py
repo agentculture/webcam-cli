@@ -1,9 +1,11 @@
-"""``webcam-cli overview`` — read-only descriptive snapshot of the agent.
+"""``webcam overview`` — read-only descriptive snapshot of the agent.
 
 Describes the agent to an agent reader: identity (from culture.yaml), the verb
-surface, and the sibling-pattern artifacts this template carries. The shared
-section/render helpers here are reused by the ``cli`` noun's ``overview`` (see
-:mod:`webcam_cli.cli._commands.cli`).
+surface, which invocations energize hardware, the identity/access contracts the
+capture verbs obey, and the consent posture — stated with its limits, never
+overstated. The shared section/render helpers here are reused by the ``cli``
+noun's ``overview`` (see :mod:`webcam_cli.cli._commands.cli`) and by the
+``stream`` noun's (see :mod:`webcam_cli.cli._commands.stream`).
 
 Descriptive verbs never hard-fail on a missing target path — an optional
 positional ``target`` is accepted and ignored (overview describes this agent,
@@ -14,23 +16,52 @@ from __future__ import annotations
 
 import argparse
 
+from webcam_cli import activation
 from webcam_cli.cli._commands.whoami import report
 from webcam_cli.cli._output import emit_result
 
-_ARTIFACTS = [
-    "culture.yaml + AGENTS.colleague.md — mesh identity (suffix + backend)",
-    ".claude/skills/ — the canonical guildmaster skill kit (cite-don't-import)",
-    "docs/skill-sources.md — skill provenance ledger",
-    "pyproject.toml + .github/workflows/ — buildable, deployable package baseline",
-]
-
 _VERBS = [
+    "list — attached capture devices: stable id, nodes, paired mic, access state",
+    "stream video|audio|av <device> — serve a live attachment point (unbounded)",
+    "record <device> <path> — record a bounded clip to one file (a duration cap always applies)",
     "whoami — identity probe (nick, version, backend, model)",
     "learn — structured self-teaching prompt",
     "explain <path> — markdown docs for a topic",
     "overview — this descriptive snapshot",
     "doctor — check the agent-identity invariants",
 ]
+
+#: The single most important thing an agent needs before invoking anything here:
+#: whether the invocation will switch a camera on. ``stream`` and ``record``
+#: share this split, and it is readable from the flags alone.
+_HARDWARE = [
+    "default (no flag) — dry run: resolves the device, validates the request, prints "
+    "the plan. Opens nothing, logs nothing.",
+    "--probe — enumerates the device's real formats, which OPENS the camera; written "
+    "to the activation log.",
+    "--apply — opens the device and streams or records; written to the activation log.",
+    "list — opens nothing beyond one non-blocking permission probe per node.",
+]
+
+_CONTRACTS = [
+    "identity is the stable id from /dev/v4l/by-id, never /dev/videoN: node numbers are "
+    "plug-order and the reference host's two cameras have already swapped",
+    "access is reported per subsystem — absent, forbidden and busy are distinct states, "
+    "each naming its own fix (seat ACL for video, 'audio' group for ALSA)",
+    "record is bounded by construction (a duration cap always applies, no flag means "
+    "'forever'); stream is unbounded by construction (there is no --duration)",
+    "an unsupported (format, resolution, fps) is a typed user error naming the "
+    "enumerated alternatives — never a silent fallback",
+]
+
+
+def _consent_items() -> list[str]:
+    return [
+        f"activation log: {activation.log_path()} (override ${activation.ENV_LOG_PATH})",
+        "a capture writes only to the path you name — no hidden buffer, never to stdout",
+        "a hardware activity light CANNOT be promised: that is device firmware, outside "
+        "this tool's control. This tool records activations; it does not prevent covert use.",
+    ]
 
 
 def agent_sections() -> list[dict[str, object]]:
@@ -47,7 +78,9 @@ def agent_sections() -> list[dict[str, object]]:
             ],
         },
         {"title": "Verbs", "items": list(_VERBS)},
-        {"title": "Sibling-pattern artifacts", "items": list(_ARTIFACTS)},
+        {"title": "What touches the hardware", "items": list(_HARDWARE)},
+        {"title": "Contracts", "items": list(_CONTRACTS)},
+        {"title": "Consent", "items": _consent_items()},
     ]
 
 
@@ -56,7 +89,11 @@ def cli_sections() -> list[dict[str, object]]:
     return [
         {
             "title": "Verbs",
-            "items": list(_VERBS) + ["cli overview — describe the CLI surface (this command)"],
+            "items": list(_VERBS)
+            + [
+                "stream overview — describe the stream verb group",
+                "cli overview — describe the CLI surface (this command)",
+            ],
         },
         {
             "title": "Conventions",
@@ -64,6 +101,8 @@ def cli_sections() -> list[dict[str, object]]:
                 "every command supports --json",
                 "results to stdout, errors/diagnostics to stderr (never mixed)",
                 "exit codes: 0 success, 1 user error, 2 environment error, 3+ reserved",
+                "writes and hardware activation are opt-in: --apply commits, --probe opens "
+                "the camera to enumerate formats, and the default is a dry run",
             ],
         },
     ]
@@ -90,7 +129,7 @@ def cmd_overview(args: argparse.Namespace) -> int:
     # `target` is accepted for rubric compatibility (descriptive verbs must not
     # hard-fail on a missing path) but overview describes this agent itself.
     emit_overview(
-        "webcam-cli",
+        "webcam",
         agent_sections(),
         json_mode=bool(getattr(args, "json", False)),
     )
@@ -100,7 +139,7 @@ def cmd_overview(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "overview",
-        help="Read-only descriptive snapshot of the agent (identity, verbs, artifacts).",
+        help="Read-only descriptive snapshot of the agent (identity, verbs, contracts, consent).",
     )
     p.add_argument(
         "target",

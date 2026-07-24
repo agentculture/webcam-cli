@@ -1,34 +1,88 @@
-"""``webcam-cli learn`` — the learnability affordance.
+"""``webcam learn`` — the learnability affordance.
 
 Prints a structured self-teaching prompt. Must satisfy the agent-first rubric:
 >=200 chars and mention purpose, command map, exit codes, --json, and explain.
+
+Beyond the rubric, this text carries the one fact an agent needs *before* it
+invokes anything here: which invocations switch a camera or microphone on. A
+tool that can open a camera is a surveillance surface, so "did that touch the
+hardware?" must be answerable from the surface alone, and the answer is stated
+here first rather than buried in a verb's ``--help``.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from webcam_cli import __version__
+from webcam_cli import __version__, activation
 from webcam_cli.cli._output import emit_result
 
+_PURPOSE = (
+    "Own the local USB capture devices — cameras and microphones — and the act of "
+    "getting frames and samples off them: enumerate what is attached, report honestly "
+    "what can be opened, then hand a consumer a live stream or a bounded recorded file "
+    "with metadata complete enough that nothing has to be re-derived."
+)
+
 _TEXT = """\
-webcam-cli — a clonable template for AgentCulture mesh agents.
+webcam — enumerate, stream, and record the local USB cameras and microphones.
+
+The installed command is `webcam`. (The project and PyPI distribution are named
+webcam-cli and the import package is webcam_cli; neither is ever typed.)
 
 Purpose
 -------
-Scaffold for a new Culture mesh agent: an agent-first CLI (cited from the teken
-`python-cli` reference), an identity (culture.yaml + CLAUDE.md), the canonical
-guildmaster skill kit under .claude/skills/, and a deploy/CI baseline. Clone it,
-rename the package, and edit culture.yaml to mint a new agent.
+Own the local USB capture devices, video and audio, and the act of getting
+frames and samples off them: enumerate what is attached, report honestly what
+each device can do and whether it can be opened right now, then hand a second
+process either a live stream or a bounded recorded file — with metadata complete
+enough that the consumer never has to re-derive what was captured or from where.
+Interpreting what is *in* a frame is a vision model's job, not this tool's.
+
+What touches the hardware — read this before invoking anything
+--------------------------------------------------------------
+`stream` and `record` share one three-level split, and which level you are on is
+readable from the flags alone:
+
+  (no flag)  Dry run. Resolves the device, validates the request, prints the
+             plan it would run. Opens no device. Logs nothing.
+  --probe    Enumerates the device's real formats. This OPENS the camera, and is
+             itself written to the activation log.
+  --apply    Opens the device and streams or records. Written to the activation
+             log. For `stream`, implies --probe.
+
+`list` opens nothing beyond a single non-blocking permission probe per node.
 
 Commands
 --------
-  webcam-cli whoami             Identity from culture.yaml.
-  webcam-cli learn              This self-teaching prompt.
-  webcam-cli explain <path>...  Markdown docs for any noun/verb path.
-  webcam-cli overview           Descriptive snapshot of the agent.
-  webcam-cli doctor             Check the agent-identity invariants.
-  webcam-cli cli overview       Describe the CLI surface itself.
+  webcam list                    Attached devices: stable id, nodes, mic, access.
+  webcam stream overview         Describe the stream verb group.
+  webcam stream video <device>   Live camera attachment point (unbounded).
+  webcam stream audio <device>   Live microphone attachment point (unbounded).
+  webcam stream av <device>      Camera plus its own mic, muxed (unbounded).
+  webcam record <device> <path>  Bounded clip to one file (--kind video|audio|av).
+  webcam whoami                  Identity from culture.yaml.
+  webcam learn                   This self-teaching prompt.
+  webcam explain <path>...       Markdown docs for any noun/verb path.
+  webcam overview                Descriptive snapshot of the agent.
+  webcam doctor                  Check the agent-identity invariants.
+  webcam cli overview            Describe the CLI surface itself.
+
+Naming a device
+---------------
+Pass the stable id from /dev/v4l/by-id (or a unique substring of it), never
+/dev/videoN: node numbers are plug order and the reference host's two cameras
+have already swapped, so an index is not a reproducible instruction. `webcam
+list --json` prints the id to use. Access failures distinguish absent from
+present-but-forbidden and name the fix per subsystem — a headless agent
+typically loses every camera (no logind seat ACL) while keeping its microphones
+('audio' group).
+
+Bounds
+------
+`record` is bounded by construction: a duration cap always applies (default 30s,
+ceiling 3600s) and no flag combination expresses "forever". `stream` is
+unbounded by construction: there is no --duration; stop it with SIGINT/SIGTERM.
 
 Machine-readable output
 -----------------------
@@ -38,36 +92,87 @@ Every command supports --json. Errors in JSON mode emit
 Exit-code policy
 ----------------
   0 success
-  1 user-input error (bad flag, bad path, missing arg)
-  2 environment / setup error
+  1 user-input error (bad flag, unknown device, unsatisfiable format)
+  2 environment error (no capture engine, forbidden or busy device)
   3+ reserved
+
+Consent
+-------
+Every activation is appended to the activation log (default
+~/.local/state/webcam-cli/activations.jsonl; override $WEBCAM_ACTIVATION_LOG),
+and a capture writes only to the path you name — no hidden buffer, never to
+stdout. A hardware activity light CANNOT be promised: that is device firmware,
+outside this tool's control. This tool records activations;
+it does not prevent covert use.
 
 More detail
 -----------
-  webcam-cli explain webcam-cli
+  webcam explain webcam
+  webcam explain list
+  webcam explain stream
+  webcam explain record
 """
 
 
 def _as_json_payload() -> dict[str, object]:
     return {
         "tool": "webcam-cli",
+        "command": "webcam",
+        "import_package": "webcam_cli",
         "version": __version__,
-        "purpose": "Clonable scaffold for a new AgentCulture mesh agent.",
+        "purpose": _PURPOSE,
         "commands": [
+            {
+                "path": ["list"],
+                "summary": "Attached capture devices: stable id, nodes, paired mic, access.",
+            },
+            {"path": ["stream"], "summary": "Live attachment points (noun group)."},
+            {"path": ["stream", "overview"], "summary": "Describe the stream verb group."},
+            {"path": ["stream", "video"], "summary": "Serve a live camera stream."},
+            {"path": ["stream", "audio"], "summary": "Serve a live microphone stream."},
+            {"path": ["stream", "av"], "summary": "Serve camera plus its own mic, muxed."},
+            {"path": ["record"], "summary": "Record a bounded clip to one file."},
             {"path": ["whoami"], "summary": "Identity probe from culture.yaml."},
             {"path": ["learn"], "summary": "Self-teaching prompt."},
             {"path": ["explain"], "summary": "Markdown docs by path."},
             {"path": ["overview"], "summary": "Descriptive snapshot of the agent."},
             {"path": ["doctor"], "summary": "Check the agent-identity invariants."},
+            {"path": ["cli"], "summary": "CLI-surface introspection (noun group)."},
             {"path": ["cli", "overview"], "summary": "Describe the CLI surface."},
         ],
+        "hardware_activation": {
+            "default": "dry run — resolves and validates, opens no device, logs nothing",
+            "--probe": "enumerates real formats; OPENS the camera; written to the activation log",
+            "--apply": "opens the device and streams/records; written to the activation log",
+            "list": "opens nothing beyond one non-blocking permission probe per node",
+        },
+        "device_selector": (
+            "the stable id from /dev/v4l/by-id (or a unique substring); a bare /dev/videoN "
+            "is refused because node numbering is plug-order, not identity"
+        ),
+        "bounds": {
+            "record": "bounded by construction — a duration cap always applies (default 30s, "
+            "ceiling 3600s); no flag means 'forever'",
+            "stream": "unbounded by construction — there is no --duration; stop with "
+            "SIGINT/SIGTERM",
+        },
         "exit_codes": {
             "0": "success",
             "1": "user-input error",
-            "2": "environment/setup error",
+            "2": "environment error",
+        },
+        "consent": {
+            "activation_log": str(activation.log_path()),
+            "activation_log_env": activation.ENV_LOG_PATH,
+            "bytes_written": "only to the path named on the command line — no hidden buffer",
+            "activity_light": (
+                "cannot be promised — a hardware activity LED is device firmware, outside "
+                "this tool's control; this tool records activations, it does not prevent "
+                "covert use"
+            ),
         },
         "json_support": True,
-        "explain_pointer": "webcam-cli explain <path>",
+        "explain_pointer": "webcam explain <path>",
     }
 
 

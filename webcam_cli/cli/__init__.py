@@ -1,9 +1,19 @@
-"""Unified CLI entry point for webcam-cli.
+"""Unified CLI entry point, installed as the ``webcam`` command.
 
-The agent-first global verbs (``whoami``, ``learn``, ``explain``, ``overview``,
-``doctor``) are registered here under :mod:`webcam_cli.cli._commands`,
-alongside the ``cli`` noun group. Future noun groups register via their own
-``register()`` functions following the same pattern.
+Two families of verbs register here under :mod:`webcam_cli.cli._commands`: the
+capture surface (``list``, the ``stream`` noun group, ``record``) and the
+agent-first introspection verbs (``whoami``, ``learn``, ``explain``,
+``overview``, ``doctor``) alongside the ``cli`` noun group. Further noun groups
+register via their own ``register()`` functions following the same pattern.
+
+Three names, one typable
+------------------------
+The console command is ``webcam`` (``[project.scripts]``), the import package is
+``webcam_cli``, and the PyPI distribution is ``webcam-cli``. ``prog`` is
+therefore ``webcam``: ``--help``, every argparse hint, and every doc string an
+agent reads must name something it can actually run. ``webcam-cli`` stays
+correct when referring to the project, the distribution, or the mesh nick — it
+is only wrong presented as a command.
 
 Error propagation contract
 --------------------------
@@ -66,12 +76,19 @@ def _build_parser() -> argparse.ArgumentParser:
     from webcam_cli.cli._commands import doctor as _doctor_cmd
     from webcam_cli.cli._commands import explain as _explain_cmd
     from webcam_cli.cli._commands import learn as _learn_cmd
+    from webcam_cli.cli._commands import list_devices as _list_cmd
     from webcam_cli.cli._commands import overview as _overview_cmd
+    from webcam_cli.cli._commands import record as _record_cmd
+    from webcam_cli.cli._commands import stream as _stream_group
     from webcam_cli.cli._commands import whoami as _whoami_cmd
 
     parser = _CliArgumentParser(
-        prog="webcam-cli",
-        description="webcam-cli — a clonable template for AgentCulture mesh agents.",
+        prog="webcam",
+        description=(
+            "webcam — own the local USB capture devices, video and audio: enumerate "
+            "what is attached, serve a live stream, record a bounded clip. Dry-run by "
+            "default; no verb opens a device without --probe or --apply."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -82,15 +99,18 @@ def _build_parser() -> argparse.ArgumentParser:
     # through _CliArgumentParser too.
     sub = parser.add_subparsers(dest="command", parser_class=_CliArgumentParser)
 
+    # The capture surface first: it is what this agent exists to do, so it is
+    # what `webcam --help` shows an agent before the introspection verbs.
+    _list_cmd.register(sub)
+    _stream_group.register(sub)
+    _record_cmd.register(sub)
+
     _whoami_cmd.register(sub)
     _learn_cmd.register(sub)
     _explain_cmd.register(sub)
     _overview_cmd.register(sub)
     _doctor_cmd.register(sub)
     _cli_group.register(sub)
-    # Register your own noun groups here:
-    #   from webcam_cli.cli._commands import my_noun as _my_noun_group
-    #   _my_noun_group.register(sub)
 
     return parser
 

@@ -21,9 +21,11 @@ The four acceptance criteria are encoded here:
 4. warm-up discard is applied at stream start, with a documented, overridable
    default.
 
-Per the task's wiring rule, these tests build a parser locally rather than
-going through ``webcam_cli.cli.main`` — ``stream`` is not registered in
-``_build_parser`` yet; task t8 wires every verb at once.
+These tests build a parser locally rather than going through
+``webcam_cli.cli.main``, keeping the verb's behaviour separable from parser
+assembly. Registration in ``_build_parser`` landed with task t8 and is asserted
+in ``tests/test_cli.py``, including that this noun's parse errors keep the
+structured exit-1 contract.
 """
 
 from __future__ import annotations
