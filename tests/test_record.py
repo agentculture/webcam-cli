@@ -25,6 +25,7 @@ Covers the three acceptance criteria of build-plan task t7:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import subprocess
@@ -248,7 +249,7 @@ class TestBoundConstruction:
 
     def test_bound_is_frozen(self) -> None:
         bound = record.Bound(duration_s=10.0, max_bytes=None, duration_is_default=False)
-        with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+        with pytest.raises(dataclasses.FrozenInstanceError, match="duration_s"):
             bound.duration_s = 5.0  # type: ignore[misc]
 
 
@@ -451,6 +452,7 @@ class TestBoundedPhaseEscapeAttempt:
         def _boom(*args, **kwargs):
             raise FileNotFoundError("no such file: gst-launch-1.0")
 
+        clock = iter([0.0]).__next__
         with pytest.raises(CliError) as exc:
             record._run_bounded_phase(
                 ["gst-launch-1.0"],
@@ -458,7 +460,7 @@ class TestBoundedPhaseEscapeAttempt:
                 max_bytes=None,
                 output_path=None,
                 popen_factory=_boom,
-                clock=iter([0.0]).__next__,
+                clock=clock,
             )
         assert exc.value.code == EXIT_ENV_ERROR
 
@@ -1259,8 +1261,9 @@ class TestTypeFunctionsRejectNonNumeric:
             type_fn(raw)
 
     def test_warmup_over_ceiling_rejected(self) -> None:
+        raw = str(record._MAX_WARMUP_S + 1)
         with pytest.raises(argparse.ArgumentTypeError):
-            record._warmup_type(str(record._MAX_WARMUP_S + 1))
+            record._warmup_type(raw)
 
     def test_warmup_negative_rejected(self) -> None:
         with pytest.raises(argparse.ArgumentTypeError):
