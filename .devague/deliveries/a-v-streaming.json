@@ -1,0 +1,33 @@
+{
+  "plan_slug": "a-v-streaming",
+  "schema_version": 1,
+  "created": "2026-07-24T16:51:21Z",
+  "updated": "2026-07-24T16:51:21Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "wave 2 (t6, t7) is built and tested hardware-free; the live --apply integration proof moves to t9",
+      "task_ref": "t6",
+      "reason": "t6's acceptance criterion 2 (a second process attaches and receives decodable frames) and t7's --apply criterion both imply live capture during wave 2. The split plan presented to the operator stated hardware activates only in wave 4; that was inaccurate. Operator chose to keep wave 2 hardware-free so camera/mic activation happens in exactly one place, t9, under their eye. Wave 2 agents mock the capture boundary; t9 carries the live proof.",
+      "affects": [
+        "t7",
+        "t9"
+      ],
+      "origin": "user",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d2",
+      "what": "dry-run does not touch hardware by default; real format enumeration is opt-in behind --probe and is itself logged as an activation",
+      "task_ref": "t6",
+      "reason": "t6 criterion 1 requires dry-run to validate the request 'against the enumerated set' AND run 'without opening the device', but engine.probe_formats shells out to gst-device-monitor-1.0, which briefly opens every camera on the host. Operator resolved the contradiction: default dry-run stays on-paper (resolve, structural check, print plan, touch nothing); --probe opts into real enumeration and writes an activation-log entry like any other activation.",
+      "affects": [
+        "t7"
+      ],
+      "origin": "user",
+      "status": "approved",
+      "classification": "acceptable"
+    }
+  ]
+}
