@@ -21,14 +21,24 @@ The build brief is [issue #1](https://github.com/agentculture/webcam-cli/issues/
 
 We produce an artifact and honest metadata about it, and stop there.
 
-## Current state: scaffold, not the product
+## Current state: the capture surface is built
 
-Nothing in the domain is implemented yet. What exists is the agent-first CLI skeleton scaffolded from `culture-agent-template`: the six template verbs (`whoami`, `learn`, `explain`, `overview`, `doctor`, `cli overview`), the error/output contract, CI, and the vendored skill kit. `webcam_cli/` contains **no capture code at all**.
+The domain surface landed on the `spec/a-v-streaming` branch, built from a converged devague spec (`docs/specs/2026-07-24-a-v-streaming.md`) and plan (`docs/plans/2026-07-24-a-v-streaming.md`). Four domain modules sit under `webcam_cli/`, and three capture verbs sit alongside the six template verbs.
 
-Two consequences worth knowing before you touch anything:
+| Module | Owns |
+|--------|------|
+| `devices.py` | logical device identity: `/dev/v4l/by-id` enumeration, multi-node UVC collapse, camera↔mic pairing through the shared sysfs USB parent, `resolve()` by stable id |
+| `access.py` | can this node be opened, and if not why: `ok` / `absent` / `forbidden` / `busy`, each with a per-subsystem remediation; `find_holder()` names a busy holder from `/proc/*/fd` |
+| `engine.py` | the GStreamer boundary: capability detection, format probing, negotiation validation, pipeline construction (argv, never a shell string) |
+| `activation.py` | the consent record: append-only JSONL, one line per activation, written on scope exit even when the body raises |
 
-1. **The self-description strings are still template prose.** `learn`, the `explain` catalog (`webcam_cli/explain/catalog.py`), and `overview`'s artifact list all describe this repo as "a clonable template for AgentCulture mesh agents". That is false — it is now a webcam agent. These are the agent-facing docs, so they must be rewritten as the domain surface lands, not after.
-2. **The console command is `webcam`, but the CLI calls itself `webcam-cli`.** `[project.scripts]` installs `webcam`; argparse is built with `prog="webcam-cli"` (`webcam_cli/cli/__init__.py:73`), so `--help`, every error hint, `learn`, and the whole `explain` catalog instruct an agent to type `webcam-cli explain …` — which is not an installed binary. The three-way split is deliberate per the brief (command `webcam`, import package `webcam_cli`, dist `webcam-cli`), but the self-docs pointing at a nonexistent command is not. Fix `prog` and the doc strings together, or the rubric's learnability guarantee is a lie to its only readers.
+Verbs: **`list`** (logical devices with per-subsystem access status), **`stream video|audio|av`** (unbounded, serves a `tcpserversink` attachment point on loopback, Matroska-contained), **`record`** (bounded by construction — a duration cap always applies and unbounded is not expressible).
+
+**The three-level hardware rule is the single most important fact about this surface**, and it is stated in `learn`, in the `explain` catalog, and in every sub-verb's epilog: no flag = dry-run that opens nothing; `--probe` = enumerates real formats, which opens the camera, and is logged; `--apply` = captures or streams, and is logged. An agent must be able to tell from the invocation alone whether hardware switches on.
+
+Both earlier defects are fixed: `prog` is now `webcam` (no user-facing string presents `webcam-cli` as typable — a test enforces it), and the template prose is gone from `learn`, the catalog, and `overview`. `webcam-cli` correctly survives as the *project*, *dist*, and *mesh nick* — do not blanket-replace it.
+
+**Not built yet**: a `describe` verb (its enumeration is currently reachable via `stream video <device> --probe --json` → `negotiation.available`), the WebSocket audio endpoint, and `events-cli` activation announcements. The last two are parked follow-ups on the frame (`v2`, `v3`), not oversights.
 
 ## Identity
 
@@ -104,27 +114,31 @@ These are design constraints, not trivia. Full derivation is in issue #1; the es
 - **Video and audio identifiers are unrelated.** The C270's camera is a `/dev/video*` node; its microphone is an ALSA card. Nothing in the numbering connects them — pairing means matching through USB topology.
 - **A/V sets are not 1:1.** `Reachy Mini Audio` is a capture device with no camera. Any model assuming each webcam has a mic is already false on the first host tested.
 - **Access comes from a seat ACL, not group membership.** The operator is *not* in the `video` group; `getfacl /dev/video0` shows `user:spark:rw-`, granted by logind to the active seat. **An agent running headless, in a container, or as a systemd unit will not get that ACL** and will fail to open a device that works fine from a desktop session. Since the users here are agents, this is the failure mode most likely to actually bite.
-- **Assume no capture backend is installed.** On this host `ffmpeg`, `v4l2-ctl`, and `fswebcam` are all absent; only `arecord` and `pactl` are present. Detect capability and fail with a clear install hint — never assume.
+- **Never assume a capture backend.** Re-surveyed 2026-07-24: `gst-launch-1.0`/`gst-inspect-1.0` **are** present (the brief's "no backend" evidence is out of date), but `ffmpeg`, `v4l2-ctl`, and `fswebcam` are all still absent — do not shell out to them. Among GStreamer elements, `v4l2src`/`alsasrc`/`matroskamux`/`jpegenc`/`vp8enc`/`opusenc`/`tcpserversink` are present and **`x264enc` is absent**, so H.264/MP4 is off this host's menu and VP8+Opus in Matroska is the encoded path. `engine.detect()` reports the plugin map; route on what it says, never on what you expect.
 - **Sensor warm-up is mandatory.** The first frames off a UVC camera are dark or badly exposed while auto-exposure settles. Grab-one-frame ships a black image — the single most common way a webcam tool "works" while producing useless output.
 
 **Consent posture.** A CLI that lets an agent silently open a camera and microphone is a surveillance surface. Be precise about what can and cannot be promised: every capture can write to a named path with no hidden buffer, and every activation can be logged. A hardware activity light **cannot** be promised — that is device firmware, outside this tool's control. State the limit; never imply the tool prevents covert use.
 
-## Open design questions
+## Design questions — how the brief's ten were settled
 
-Ten questions in issue #1 are parked deliberately rather than guessed at. Settle them with the operator — do not quietly assume an answer while implementing. The ones that most constrain code shape (numbered as in the brief):
+Issue #1 parked ten questions. The A/V streaming spec settled most of them **with the operator**, and the frame (`.devague/frames/a-v-streaming.json`) records who decided what. Do not silently re-open a settled one; the decisions are load-bearing for code already written.
 
-- **Q1 — Is capture a "write"?** The template contract is *dry-run by default, `--apply` commits*. Capture writes a file and energises hardware. The brief recommends treating it as a write (dry-run resolves the device, validates the format, and prints the path it would write) so agents can probe cheaply — recommended, not yet confirmed.
-- **Q2 — Capture engine and dependency posture** — shell out versus Python libraries. See the zero-deps note above.
-- **Q3 — Headless permission model** — `list` must distinguish *absent* from *present-but-forbidden* and name the fix. Silence turns into "the agent says there is no camera" when there plainly is one.
-- **Q4 — Exclusive access** — V4L2 streaming is single-open. Fail fast with a typed error naming the holder if determinable; never hang.
-- **Q6 — Format negotiation** — validate a requested (format, resolution, fps) against the enumerated set and report what you actually got, rather than silently falling back.
-- **Q7 — A/V pairing** — is "record the C270's camera *and* its mic" one verb, and who muxes?
+| Q | Settled as |
+|---|-----------|
+| Q1 capture-as-write | **Yes**, and refined into three levels: default dry-run opens nothing, `--probe` enumerates for real (opens the camera, logged), `--apply` captures (logged). Recorded as deviation `d2` after the original "validate against the enumerated set *without* opening the device" proved self-contradictory. |
+| Q2 engine + deps | **Shell out to `gst-launch-1.0`**; `dependencies = []` stays empty. Capability detection is mandatory and a missing engine is a typed exit-2 with an install hint. |
+| Q3 headless permissions | `access.py` separates *absent* from *forbidden* and names the fix per subsystem — seat ACL (and its headless/container loss) for video, `audio`-group for ALSA. |
+| Q4 exclusive access | Typed busy error, bounded time, never hangs; `find_holder()` names the holder when `/proc` permits and degrades to holder-unknown otherwise. |
+| Q5 warm-up | Mandatory and overridable. **Defaults were provisional pending on-host measurement** — see the acceptance record for the measured figure. |
+| Q6 negotiation | `validate_negotiation()` grants or raises; **never a silent fallback**. Partial requests act as a constraint set, and the payload always reports requested-vs-negotiated. |
+| Q7 A/V pairing | Pairing is derived from the **shared sysfs USB parent**, never index correlation. `stream av` muxes in-tool via `matroskamux`. |
+| Q8 consent | Every activation is logged (`~/.local/state/webcam-cli/activations.jsonl`, override `$WEBCAM_ACTIVATION_LOG`); capture writes only to the named target. The tool states plainly that it **cannot** promise a hardware activity light. |
+| Q9 Reachy Mini | **Out of scope** for this iteration — only the Logitech C270 and its onboard mic are targeted (boundary claim `c27`). |
+| Q10 `events-cli` | **Still open**, parked as follow-up `v2`: announcing stream start/stop is a consumer relationship to settle with the sibling agent. |
 
-The rest (Q5 warm-up, Q8 consent posture) are folded into the constraints above; Q9 (Reachy Mini camera) and Q10 (`events-cli` relationship) are cross-repo and need the sibling agents.
+Still genuinely open, parked on the frame rather than guessed: **`v3`** — a WebSocket audio-only endpoint (realtime-API style PCM/Opus chunks) layered on the buffer, deferred so iteration 1 ships one uniform transport.
 
-Whatever is decided, `--json` must be complete enough that a follow-on tool never has to re-derive what was captured or from where.
-
-The suggested starting surface, on top of the template verbs, is `webcam list`, `webcam describe <device>`, `webcam capture <device>`, `webcam record <device>`.
+`--json` must stay complete enough that a follow-on tool never has to re-derive what was captured or from where. That is the property the on-host acceptance run exists to prove.
 
 ## Conventions and workflow
 
@@ -148,16 +162,28 @@ The suggested starting surface, on top of the template verbs, is `webcam list`, 
 
 ```text
 webcam_cli/
+  devices.py              logical device identity; enumerate_devices(root), resolve(selector)
+  access.py               ok/absent/forbidden/busy + per-subsystem remediation; find_holder()
+  engine.py               GStreamer boundary: detect, probe_formats, validate_negotiation, build_*_pipeline
+  activation.py           append-only consent log; activation_scope() writes one line on exit
   cli/__init__.py         parser assembly, _dispatch, exception→exit-code translation
   cli/_errors.py          CliError + exit-code policy (stable contract)
   cli/_output.py          stdout/stderr split (stable contract)
   cli/_commands/          one module per verb, each exposing register(sub)
+                          list_devices.py · stream.py (noun group) · record.py · the six template verbs
   explain/catalog.py      markdown keyed by command-path tuple — every path needs an entry
-tests/                    smoke + introspection tests
-.claude/skills/           vendored guildmaster skill kit (cite-don't-import; never edit)
+tests/                    smoke, introspection, and per-module suites
+  conftest.py             resets the sticky _CliArgumentParser._json_hint between tests
+  fixtures/               synthetic sysfs/proc trees: host-baseline, host-renumbered, camera-only, degraded
+docs/specs/               exported devague specs (the converged frame)
+docs/plans/               exported devague plans (tasks, waves, risks)
 docs/skill-sources.md     skill provenance ledger + re-sync procedure
+.devague/                 frame + plan state; questions/ and reviews/ are gitignored working state
+.claude/skills/           vendored guildmaster skill kit (cite-don't-import; never edit)
 culture.yaml              mesh identity (suffix + backend)
 AGENTS.colleague.md       resident mesh prompt (backend: colleague)
 ```
 
-This file describes the repository **as it exists on disk today**. Keep claims grounded in checked-in reality; if a section drifts ahead of reality, mark it `(planned)` or move it under a `## Roadmap` heading. The domain sections above are the one place that intentionally describes work not yet built — they are marked as such, and they cite issue #1 rather than asserting a design.
+Two testing notes that will bite otherwise. **`_json_hint` is class-level state** that `main()` sets from raw argv and never clears — correct inside one CLI process, sticky across a test session, so `tests/conftest.py` resets it around every test. A module ending on a `--json` call otherwise makes a later test that builds its own parser render errors as JSON. And **the fixture trees contain colons** in path names (`NVDA8000:01`, `3-1:1.0`) because real sysfs does and the interface colon is load-bearing for the USB-parent regex — that makes this repo un-checkout-able on Windows, which is acceptable for a V4L2/ALSA tool but is a constraint it did not previously have.
+
+This file describes the repository **as it exists on disk today**. Keep claims grounded in checked-in reality; if a section drifts ahead of reality, mark it `(planned)` or move it under a `## Roadmap` heading.
