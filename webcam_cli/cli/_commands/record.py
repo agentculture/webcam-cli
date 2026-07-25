@@ -42,19 +42,29 @@ regardless of how badly the child misbehaves.
 
 Dry-run / --probe split (deviations d1, d2)
 --------------------------------------------
-Default dry-run (no ``--apply``) is on-paper only: it resolves the device,
-does non-blocking access probes (:func:`webcam_cli.access.check_access` — an
-``O_NONBLOCK`` open/close, not a capture, and safe to call from a dry run by
-that module's own design), and structurally validates any requested format by
-calling the *same* pure pipeline builders (:func:`webcam_cli.engine.
+Default dry-run (no ``--apply`` and no ``--probe``) is on-paper only: it
+resolves the device, reports access via a *non-opening* filesystem check
+(:func:`_paper_access_report` — ``os.path.exists``/``os.access`` bit tests,
+never ``open()``), and structurally validates any requested format by calling
+the *same* pure pipeline builders (:func:`webcam_cli.engine.
 build_video_pipeline` et al.) real capture would use — those never shell out.
-It never calls :func:`webcam_cli.engine.probe_formats`, which shells out to
-``gst-device-monitor-1.0`` and briefly opens the camera. ``--probe`` opts a
-dry run into that real enumeration, and — because it energizes the sensor —
-is itself wrapped in :func:`webcam_cli.activation.activation_scope` like any
-other activation. ``--apply`` always negotiates for real (it is about to
-activate the device anyway), so ``--probe`` is accepted-but-ignored alongside
-``--apply`` rather than rejected as a conflicting flag.
+A plain ``os.access`` check cannot tell whether a node that exists and looks
+permitted is already held open by another process: V4L2 exclusivity is only
+enforced at ``S_FMT``/``STREAMON``, not at ``open(2)`` (see
+:func:`webcam_cli.access.busy_error`'s docstring), so that case is reported as
+``"unknown"``, never ``"ok"`` — the payload says plainly that ``--probe`` or
+``--apply`` is what actually finds out. Default dry-run never calls
+:func:`webcam_cli.access.check_access` (an ``open()``/``close()`` pair) or
+:func:`webcam_cli.engine.probe_formats` (which shells out to
+``gst-device-monitor-1.0``) — both really touch the device, so both stay off
+the no-flag path entirely, matching "no flag = opens nothing, logs nothing".
+``--probe`` opts a dry run into real enumeration *and* the real
+``access.check_access`` open/close for the access block, and — because it
+energizes the sensor — is itself wrapped in
+:func:`webcam_cli.activation.activation_scope` like any other activation.
+``--apply`` always negotiates for real (it is about to activate the device
+anyway), so ``--probe`` is accepted-but-ignored alongside ``--apply`` rather
+than rejected as a conflicting flag.
 
 Exactly one artifact
 ---------------------
@@ -491,6 +501,111 @@ def _access_report(
     return {"video": video_report, "audio": audio_report}
 
 
+# --- non-opening access check, for the no-flag dry-run path only -----------
+#
+# A plain ``webcam record`` dry-run must not energize hardware at all — see
+# the module docstring's "Dry-run / --probe split" and CLAUDE.md's
+# three-level hardware rule ("no flag = opens nothing, logs nothing"). The
+# real ``access.check_access`` above performs an ``os.open()``/``os.close()``
+# pair to answer its question, which *is* a hardware touch (a UVC camera can
+# power on or light its LED on open) — safe for ``--probe``/``--apply``,
+# which already document themselves as touching hardware, but wrong for a
+# bare dry-run. These helpers answer the same "can this node be opened"
+# question using only ``os.path.exists``/``os.access`` bit tests, which never
+# call ``open(2)``. That means one thing is structurally undeterminable here:
+# EBUSY. V4L2 exclusivity is enforced at ``S_FMT``/``STREAMON``, not at
+# ``open(2)`` (see :func:`webcam_cli.access.busy_error`'s docstring), so a
+# node that exists and looks permitted is reported ``"unknown"``, never
+# ``"ok"`` — only a real open (``--probe``/``--apply``) can tell the two
+# apart.
+
+
+def _paper_absent_remediation(kind: str, path: str) -> str:
+    if kind == "audio":
+        return (
+            f"{path} does not exist — check the microphone/card is plugged in and "
+            "listed by 'arecord -l' or /proc/asound/cards; ALSA card numbers renumber "
+            "on replug, so a stale path is the most common cause. (checked without "
+            "opening the device: pass --probe or --apply to actually try.)"
+        )
+    return (
+        f"{path} does not exist — check the camera is plugged in and listed under "
+        "/dev/v4l/by-id/ (or /dev/videoN); V4L2 node numbers renumber on replug, so a "
+        "stale path is the most common cause. (checked without opening the device: "
+        "pass --probe or --apply to actually try.)"
+    )
+
+
+def _paper_forbidden_remediation(kind: str, path: str) -> str:
+    if kind == "audio":
+        return (
+            f"permission denied opening {path} — ALSA capture devices are gated by "
+            "'audio'-group membership; add the invoking user to the 'audio' group and "
+            "re-login (unlike /dev/video*, there is no seat-ACL path for ALSA on this "
+            "host). (checked without opening the device: the permission bits alone say "
+            "this, --probe/--apply would fail the same way.)"
+        )
+    return (
+        f"permission denied opening {path} — on an active desktop session, logind "
+        f"grants a per-seat ACL (see 'getfacl {path}'); a headless, containerized, or "
+        "systemd-unit session receives no seat and will not get that ACL even though a "
+        "human's desktop login would. Run this from an active graphical/logind seat, or "
+        "add the invoking user to the 'video' group and re-login as a fallback. (checked "
+        "without opening the device: the permission bits alone say this, --probe/--apply "
+        "would fail the same way.)"
+    )
+
+
+def _paper_unknown_remediation(path: str) -> str:
+    return (
+        f"{path} exists and its permission bits look sufficient, but this is a dry-run "
+        "and it never opens the device, so whether it is already held open by another "
+        "process (EBUSY) genuinely cannot be determined here — pass --probe or --apply "
+        "to find out for real"
+    )
+
+
+def _paper_state_for(path: str, kind: str) -> tuple[str, str]:
+    """Non-opening access check: ``(state, remediation)`` without any ``os.open()`` call.
+
+    ``state`` is one of ``"absent"`` (no node at ``path``), ``"forbidden"``
+    (the node exists but the permission bits deny the access this ``kind``
+    needs), or ``"unknown"`` (the node exists and looks permitted, but
+    busy/EBUSY is not determinable without opening — see the section banner
+    above). There is no ``"ok"``/``"busy"`` outcome here on purpose: this
+    function never opens anything, so it can never actually confirm either.
+    """
+    if not os.path.exists(path):
+        return "absent", _paper_absent_remediation(kind, path)
+    needed = os.R_OK | os.W_OK if kind == "video" else os.R_OK
+    if not os.access(path, needed):
+        return "forbidden", _paper_forbidden_remediation(kind, path)
+    return "unknown", _paper_unknown_remediation(path)
+
+
+def _paper_report(path: str, kind: str) -> dict[str, object]:
+    state, remediation = _paper_state_for(path, kind)
+    return {"state": state, "path": path, "remediation": remediation}
+
+
+def _paper_access_report(
+    device: LogicalDevice, kind: str, capture_node: str | None
+) -> dict[str, object | None]:
+    """The no-flag dry-run's access block: same shape as :func:`_access_report`.
+
+    Never calls :func:`webcam_cli.access.check_access` (or anything else that
+    opens a device) — see the section banner above for why.
+    """
+    video_report = None
+    audio_report = None
+    if kind in ("video", "av") and capture_node is not None:
+        video_report = _paper_report(capture_node, "video")
+    if kind in ("audio", "av") and device.audio is not None:
+        audio_path = _audio_node_path(device.audio)
+        audio_report = _paper_report(audio_path, "audio")
+    return {"video": video_report, "audio": audio_report}
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -842,7 +957,11 @@ def _dry_run(
         "warmup_basis": _WARMUP_BASIS,
         "output_path": output_path,
         "would_write": [output_path],
-        "access": _access_report(device, kind, capture_node),
+        "access": (
+            _access_report(device, kind, capture_node)
+            if probe
+            else _paper_access_report(device, kind, capture_node)
+        ),
         "engine": {"available": cap.available, "gst_launch_present": cap.gst_launch is not None},
         "timestamps": {"resolved_at": _now_iso()},
     }

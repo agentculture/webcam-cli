@@ -28,6 +28,7 @@ import argparse
 import dataclasses
 import json
 import math
+import os
 import subprocess
 from pathlib import Path
 
@@ -86,6 +87,15 @@ def _device_mic_only() -> LogicalDevice:
 
 
 DEVICE = _device_with_mic()
+
+# Captured at collection time, before the ``env`` fixture ever monkeypatches
+# ``access.check_access`` on the shared module object -- ``record.access`` and
+# this module's ``access`` are literally the same module, so grabbing the
+# "real" function *inside* a test that also uses ``env`` would just re-read
+# whatever ``env`` already substituted. Tests that need to exercise the
+# genuine implementation (e.g. proving no-flag dry-run never reaches
+# ``os.open``) restore this reference explicitly.
+_REAL_CHECK_ACCESS = access.check_access
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -649,21 +659,127 @@ class TestDryRun:
         with pytest.raises(CliError):
             args.func(args)
 
-    def test_dry_run_reports_busy_access_with_holder(
+    def test_default_dry_run_never_calls_check_access(
         self, env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        holder = access.Holder(pid=4242, command="cheese")
-        busy = access.AccessReport(
-            path="/dev/video0",
-            kind="video",
-            state=access.AccessState.BUSY,
-            remediation="busy: held by cheese (pid 4242)",
-            holder=holder,
-        )
-        monkeypatch.setattr(record.access, "check_access", lambda path, kind: busy)
+        """Regression test for the Qodo-flagged bug: no-flag dry-run must not
+
+        call :func:`webcam_cli.access.check_access` at all -- that function
+        performs a real ``os.open()``/``os.close()`` on the device node,
+        which contradicts the documented "no flag = opens nothing, logs
+        nothing" guarantee (see the module docstring's "Dry-run / --probe
+        split" and ``CLAUDE.md``'s three-level hardware rule).
+        """
+
+        def _boom(*_a, **_k):  # pragma: no cover - failure path
+            raise AssertionError("check_access must not be called in a no-flag dry-run")
+
+        monkeypatch.setattr(record.access, "check_access", _boom)
         payload = _out(["record", "C270", "/tmp/out.mkv", "--json"], capsys)
-        assert payload["access"]["video"]["state"] == "busy"
-        assert "cheese" in payload["access"]["video"]["remediation"]
+        assert payload["mode"] == "dry-run"
+
+    def test_default_dry_run_never_calls_os_open(
+        self, env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Belt-and-suspenders: no *transitive* path to ``os.open`` either.
+
+        Deliberately restores the *real* ``access.check_access`` (undoing the
+        ``env`` fixture's convenience stub) so this test exercises the actual
+        production call graph, then patches ``os.open`` as seen from
+        :mod:`webcam_cli.access` -- the only module in this call graph that
+        would ever call it -- to prove no code path between ``cmd_record``
+        and a device node reaches ``open(2)`` on a no-flag dry-run.
+        """
+
+        def _boom(*_a, **_k):  # pragma: no cover - failure path
+            raise AssertionError("os.open must not be called in a no-flag dry-run")
+
+        monkeypatch.setattr(record.access, "check_access", _REAL_CHECK_ACCESS)
+        monkeypatch.setattr(access.os, "open", _boom)
+        payload = _out(["record", "C270", "/tmp/out.mkv", "--json"], capsys)
+        assert payload["mode"] == "dry-run"
+
+    def test_dry_run_access_reports_absent_for_missing_node(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        # Deliberately a path guaranteed not to exist -- unlike other tests
+        # in this suite, DEVICE.capture_node ("/dev/video0") cannot be relied
+        # on here: this repo runs against real hardware on some hosts, where
+        # that path genuinely exists.
+        missing = tmp_path / "no-such-video-node"
+        device = dataclasses.replace(DEVICE, capture_node=str(missing))
+        monkeypatch.setattr(record.devices, "resolve", lambda s, root="/": device)
+        payload = _out(["record", "C270", "/tmp/out.mkv", "--json"], capsys)
+        assert payload["access"]["video"]["state"] == "absent"
+        assert payload["access"]["video"]["path"] == str(missing)
+        assert payload["access"]["video"]["remediation"]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+    def test_dry_run_access_reports_forbidden_for_unreadable_node(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        blocked = tmp_path / "blocked-video"
+        blocked.write_bytes(b"")
+        os.chmod(blocked, 0o000)
+        device = dataclasses.replace(DEVICE, capture_node=str(blocked))
+        monkeypatch.setattr(record.devices, "resolve", lambda s, root="/": device)
+        try:
+            payload = _out(["record", "C270", "/tmp/out.mkv", "--json"], capsys)
+        finally:
+            os.chmod(blocked, 0o644)  # restore so tmp_path cleanup can remove it
+        assert payload["access"]["video"]["state"] == "forbidden"
+        assert payload["access"]["video"]["path"] == str(blocked)
+
+    def test_dry_run_access_reports_unknown_when_node_exists_and_permitted(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Busy is genuinely not determinable without opening (see access.py's
+
+        ``busy_error`` docstring: V4L2 exclusivity is only enforced at
+        S_FMT/STREAMON, not open(2)) -- a node that exists and looks
+        permitted must be reported ``"unknown"``, never ``"ok"``, and the
+        remediation must say plainly that --probe/--apply is what finds out.
+        """
+        node = tmp_path / "video0"
+        node.write_bytes(b"")
+        device = dataclasses.replace(DEVICE, capture_node=str(node))
+        monkeypatch.setattr(record.devices, "resolve", lambda s, root="/": device)
+        payload = _out(["record", "C270", "/tmp/out.mkv", "--json"], capsys)
+        assert payload["access"]["video"]["state"] == "unknown"
+        text = payload["access"]["video"]["remediation"].lower()
+        assert "busy" in text or "ebusy" in text
+        assert "--probe" in text or "--apply" in text
+
+    def test_probe_dry_run_still_uses_real_check_access_for_access_block(
+        self, env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Requirement 3: --probe/--apply keep the existing real check_access
+
+        behaviour unchanged -- only the no-flag dry-run path changes.
+        """
+        calls: list[tuple[str, str]] = []
+
+        def _spy(path: str, kind: str) -> access.AccessReport:
+            calls.append((path, kind))
+            return _ok_report(path, kind)
+
+        monkeypatch.setattr(record.access, "check_access", _spy)
+        monkeypatch.setattr(record.engine, "probe_formats", lambda node: _SAMPLE_FORMATS)
+        payload = _out(["record", "C270", "/tmp/out.mkv", "--probe", "--json"], capsys)
+        assert ("/dev/video0", "video") in calls
+        assert payload["access"]["video"]["state"] == "ok"
 
     def test_dry_run_text_mode_smoke(self, env, capsys: pytest.CaptureFixture[str]) -> None:
         args = _parse(["record", "C270", "/tmp/out.mkv"])
