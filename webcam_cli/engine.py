@@ -172,17 +172,71 @@ class AudioFormat:
 # --- capability detection ----------------------------------------------------
 
 
-def _element_present(gst_inspect: str, element: str) -> bool:
-    """Probe a single element via ``gst-inspect-1.0 <element>``.
+def _gst_inspect_supports_exists(gst_inspect: str) -> bool:
+    """Detect, once per :func:`detect` call, whether ``--exists`` is available.
 
-    Observed on-host behaviour: exit 0 with details on stdout when the
-    element/plugin is present; a non-zero exit (255 on this host) with
-    "No such element or plugin '<name>'" on stderr when it is absent.
-    Any failure to even run the probe is treated as absent, never a crash.
+    Runs ``gst-inspect-1.0 --help`` and checks its stdout for the
+    ``--exists`` option. ``--help`` was strace-verified (during this fix, on
+    a live gst-inspect-1.0 1.24.2) to open zero ``/dev/video*`` / ``/dev/snd``
+    nodes, so this check is itself safe to run unconditionally from a
+    no-flag dry-run — unlike the plain per-element probe it exists to avoid
+    (see :func:`_element_present`).
+
+    Deliberately probed once and the result threaded through every
+    per-element call in :func:`detect`, not re-checked per element — that
+    would be 13 extra subprocess spawns for a fact that cannot change
+    mid-sweep. Any failure to even run ``--help``, or a non-zero exit, is
+    treated as "unsupported" so callers take the safe (if side-effecting)
+    fallback path rather than assume a flag that might not exist.
     """
     try:
         result = subprocess.run(
-            [gst_inspect, element],
+            [gst_inspect, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_PROBE_TIMEOUT_S,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    return "--exists" in (result.stdout or "")
+
+
+def _element_present(gst_inspect: str, element: str, use_exists: bool) -> bool:
+    """Probe whether one GStreamer element/plugin is present.
+
+    Two forms, selected by ``use_exists`` (see :func:`_gst_inspect_supports_exists`):
+
+    * ``gst-inspect-1.0 --exists <element>`` (preferred): exit 0 when
+      present, exit 1 when absent, no stdout/stderr detail either way.
+    * ``gst-inspect-1.0 <element>`` (fallback, plain form): exit 0 with
+      details on stdout when present; a non-zero exit (255 on this host)
+      with "No such element or plugin '<name>'" on stderr when absent.
+
+    **Why ``--exists`` is preferred is not style — it is the fix for a
+    device-open bug.** The plain form's introspection of ``v4l2src`` opens
+    *every* ``/dev/video*`` node on the host as a side effect (strace-verified
+    during this fix: probing plain ``v4l2src`` alone opened
+    ``/dev/video0`` through ``/dev/video3``, all four nodes, including ones
+    out of scope for this iteration). Because :func:`detect` runs
+    unconditionally from ``record``'s no-flag dry-run path, that silently
+    violated the "a no-flag dry-run opens nothing" consent guarantee this
+    repo treats as its single most important rule. ``--exists`` was
+    independently strace-verified, across all elements this module probes,
+    to open zero ``/dev/video*`` / ``/dev/snd`` nodes. The plain-form
+    fallback below still opens devices when it runs — it exists only for a
+    ``gst-inspect-1.0`` old enough to predate ``--exists``, a genuinely rare
+    case worth degrading for, not the common path.
+
+    Any failure to even run the probe is treated as absent, never a crash.
+    """
+    argv = [gst_inspect, "--exists", element] if use_exists else [gst_inspect, element]
+    try:
+        result = subprocess.run(
+            argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=_PROBE_TIMEOUT_S,
@@ -204,7 +258,10 @@ def detect() -> Capability:
     gst_inspect = shutil.which(GST_INSPECT)
 
     if gst_inspect is not None:
-        plugins = {element: _element_present(gst_inspect, element) for element in _ALL_ELEMENTS}
+        use_exists = _gst_inspect_supports_exists(gst_inspect)
+        plugins = {
+            element: _element_present(gst_inspect, element, use_exists) for element in _ALL_ELEMENTS
+        }
     else:
         plugins = dict.fromkeys(_ALL_ELEMENTS, False)
 
