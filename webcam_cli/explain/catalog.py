@@ -64,8 +64,14 @@ reproducible instruction. `webcam list --json` prints the id to use.
 
 - `0` success
 - `1` user-input error (unknown device, unsatisfiable format, bad flag)
-- `2` environment error (no capture engine, forbidden or busy device)
-- `3+` reserved
+- `2` environment error (no capture engine, forbidden device) — not retryable
+  without a config/environment fix
+- `3` device busy (EBUSY) — retryable; another process holds the device, and
+  waiting for it to release (or stopping it) is enough, no fix needed. Kept
+  distinct from `2` on purpose: an agent that gets the same code for both
+  cannot tell "wait and retry" from "this will never work" without
+  string-matching the message.
+- `4+` reserved
 
 ## Consent
 

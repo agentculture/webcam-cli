@@ -104,8 +104,10 @@ Exit-code policy
 ----------------
   0 success
   1 user-input error (bad flag, unknown device, unsatisfiable format)
-  2 environment error (no capture engine, forbidden or busy device)
-  3+ reserved
+  2 environment error (no capture engine, forbidden device) — not retryable
+    without a config/environment fix
+  3 device busy (EBUSY) — retryable; another process holds the device
+  4+ reserved
 
 Consent
 -------
@@ -170,7 +172,8 @@ def _as_json_payload() -> dict[str, object]:
         "exit_codes": {
             "0": "success",
             "1": "user-input error",
-            "2": "environment error",
+            "2": "environment error — not retryable without a config fix",
+            "3": "device busy (EBUSY) — retryable",
         },
         "consent": {
             "activation_log": str(activation.log_path()),

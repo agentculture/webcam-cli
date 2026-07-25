@@ -45,7 +45,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 
-from webcam_cli.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from webcam_cli.cli._errors import EXIT_BUSY_ERROR, EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
 __all__ = [
     "AccessState",
@@ -356,9 +356,14 @@ def access_error(report: AccessReport) -> CliError:
 
     Exit-code policy:
 
-    * ``ABSENT``    -> ``EXIT_USER_ERROR`` (1) — the agent named a device that isn't there.
-    * ``FORBIDDEN`` -> ``EXIT_ENV_ERROR``  (2) — the host/session is misconfigured.
-    * ``BUSY``      -> ``EXIT_ENV_ERROR``  (2) — a transient environment condition.
+    * ``ABSENT``    -> ``EXIT_USER_ERROR``  (1) — the agent named a device that isn't there.
+    * ``FORBIDDEN`` -> ``EXIT_ENV_ERROR``   (2) — the host/session is misconfigured; not
+      retryable without a config fix (seat ACL, group membership).
+    * ``BUSY``      -> ``EXIT_BUSY_ERROR``  (3) — another process holds the device.
+      Deliberately distinct from ``FORBIDDEN``: BUSY is retryable (wait for the
+      holder to release it, or stop it) while FORBIDDEN is not, and an agent
+      cannot tell those apart from a shared exit code without string-matching
+      the message — exactly what a typed code exists to prevent.
 
     Calling this with an ``OK`` report is a programming error, not a device
     outcome, and raises ``ValueError``.
@@ -380,12 +385,13 @@ def access_error(report: AccessReport) -> CliError:
             remediation=report.remediation,
         )
 
-    # BUSY
+    # BUSY — retryable, so it gets its own code rather than sharing
+    # EXIT_ENV_ERROR with FORBIDDEN (which is not retryable).
     holder_desc = ""
     if report.holder is not None:
         holder_desc = f" (held by {report.holder.command}, pid {report.holder.pid})"
     return CliError(
-        code=EXIT_ENV_ERROR,
+        code=EXIT_BUSY_ERROR,
         message=f"{report.kind} device {report.path} is busy{holder_desc}",
         remediation=report.remediation,
     )

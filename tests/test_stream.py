@@ -43,7 +43,7 @@ import pytest
 from webcam_cli import access, activation, devices, engine
 from webcam_cli.cli import _CliArgumentParser
 from webcam_cli.cli._commands import stream
-from webcam_cli.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from webcam_cli.cli._errors import EXIT_BUSY_ERROR, EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
 # --- fixtures / fakes -------------------------------------------------------
 
@@ -730,7 +730,8 @@ def test_a_busy_v4l2_device_becomes_the_typed_busy_error(
     with pytest.raises(CliError) as exc:
         _run(["stream", "video", "c270", "--apply", "--port", "0"])
 
-    assert exc.value.code == EXIT_ENV_ERROR
+    # BUSY is the retryable class, distinct from the generic env error.
+    assert exc.value.code == EXIT_BUSY_ERROR
     assert "busy" in exc.value.message
     assert "/dev/video0" in exc.value.message
     assert "pid 99" in exc.value.message
@@ -788,7 +789,7 @@ def test_apply_propagates_the_typed_busy_error(monkeypatch: pytest.MonkeyPatch) 
     procs = _grant_spawn(monkeypatch)
 
     busy = CliError(
-        EXIT_ENV_ERROR,
+        EXIT_BUSY_ERROR,
         "video device /dev/video0 is busy (held by gst-launch-1.0, pid 99)",
         "stop that process, then retry",
     )
@@ -800,7 +801,7 @@ def test_apply_propagates_the_typed_busy_error(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(CliError) as exc:
         _run(["stream", "video", "c270", "--apply", "--port", "0"])
-    assert exc.value.code == EXIT_ENV_ERROR
+    assert exc.value.code == EXIT_BUSY_ERROR
     assert "pid 99" in exc.value.message
     assert procs == []
 

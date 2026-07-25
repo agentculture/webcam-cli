@@ -93,13 +93,13 @@ Noun groups nest via `p.add_subparsers(..., parser_class=type(p))` — passing `
 
 ### The two stable contracts
 
-**Errors** (`cli/_errors.py`, `cli/__init__.py`): every failure raises `CliError(code, message, remediation)`. `_dispatch` catches it, and wraps any other exception, so **no traceback ever reaches stderr**. Exit codes: `0` success, `1` user error, `2` environment error, `3+` reserved. Text mode renders `error:` + `hint:`; JSON mode emits `{code, message, remediation}`.
+**Errors** (`cli/_errors.py`, `cli/__init__.py`): every failure raises `CliError(code, message, remediation)`. `_dispatch` catches it, and wraps any other exception, so **no traceback ever reaches stderr**. Exit codes: `0` success, `1` user error, `2` environment error (not retryable without a config fix), `3` device busy/EBUSY (retryable), `4+` reserved. Text mode renders `error:` + `hint:`; JSON mode emits `{code, message, remediation}`.
 
 `_CliArgumentParser` routes argparse's own errors through the same path. Because parse-time failures happen before `args.json` exists, `main()` pre-scans raw argv for `--json` into a class-level `_json_hint` — that is why the flag has to be sniffed twice.
 
 **Output** (`cli/_output.py`): results to stdout, errors and diagnostics to stderr, **never mixed**. Every command takes `--json`. The rubric asserts stderr is empty on success.
 
-Two failure classes the domain work will add — `EBUSY` on an already-open camera, and present-but-forbidden device nodes — need their own typed treatment inside this contract rather than a generic `code=2`. See open questions 3 and 4.
+The two failure classes the domain work added — `EBUSY` on an already-open camera, and present-but-forbidden device nodes — now have their own typed treatment inside this contract rather than sharing a generic `code=2`: `access.access_error()` maps `AccessState.BUSY` to `EXIT_BUSY_ERROR` (3) and `AccessState.FORBIDDEN` still to `EXIT_ENV_ERROR` (2), because busy is retryable and forbidden is not. See open questions 3 and 4.
 
 ### Identity plumbing
 
