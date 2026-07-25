@@ -23,12 +23,14 @@ from webcam_cli.cli._output import emit_result
 _VERBS = [
     "list — attached capture devices: stable id, nodes, paired mic, access state",
     "stream video|audio|av <device> — serve a live attachment point (unbounded)",
+    "stream overview — describe the stream verb group (bare 'stream' does the same)",
     "record <device> <path> — record a bounded clip to one file (a duration cap always applies)",
     "whoami — identity probe (nick, version, backend, model)",
     "learn — structured self-teaching prompt",
     "explain <path> — markdown docs for a topic",
     "overview — this descriptive snapshot",
     "doctor — check the agent-identity invariants",
+    "cli overview — describe the CLI surface itself (bare 'cli' does the same)",
 ]
 
 #: The single most important thing an agent needs before invoking anything here:
@@ -85,15 +87,17 @@ def agent_sections() -> list[dict[str, object]]:
 
 
 def cli_sections() -> list[dict[str, object]]:
-    """Sections describing the CLI surface itself (used by `cli overview`)."""
+    """Sections describing the CLI surface itself (used by `cli overview`).
+
+    ``_VERBS`` is the single source of truth for the registered surface (see
+    :func:`test_every_registered_path_appears_in_overview_verbs` in
+    ``tests/test_cli.py``), so this reuses it verbatim rather than
+    re-declaring ``stream overview``/``cli overview`` here too.
+    """
     return [
         {
             "title": "Verbs",
-            "items": list(_VERBS)
-            + [
-                "stream overview — describe the stream verb group",
-                "cli overview — describe the CLI surface (this command)",
-            ],
+            "items": list(_VERBS),
         },
         {
             "title": "Conventions",
