@@ -35,7 +35,7 @@ import pytest
 
 from webcam_cli import access, activation, engine
 from webcam_cli.cli._commands import record
-from webcam_cli.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from webcam_cli.cli._errors import EXIT_BUSY_ERROR, EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from webcam_cli.devices import AudioCard, LogicalDevice, VideoNode
 
 # ---------------------------------------------------------------------------
@@ -927,7 +927,8 @@ class TestApply:
         with pytest.raises(CliError) as exc:
             args.func(args)
 
-        assert exc.value.code == EXIT_ENV_ERROR
+        # BUSY is the retryable class, distinct from the generic env error.
+        assert exc.value.code == EXIT_BUSY_ERROR
         assert "busy" in exc.value.message
         assert "/dev/video0" in exc.value.message
         assert "pid 77" in exc.value.message
@@ -1093,14 +1094,14 @@ class TestApply:
         output = tmp_path / "clip.mkv"
 
         def _raise_busy(path, kind):
-            raise CliError(EXIT_ENV_ERROR, f"{kind} device {path} is busy", remediation="wait")
+            raise CliError(EXIT_BUSY_ERROR, f"{kind} device {path} is busy", remediation="wait")
 
         monkeypatch.setattr(record.access, "require_access", _raise_busy)
         monkeypatch.setattr(record.subprocess, "Popen", _RaisingPopen())
         args = _parse(["record", "C270", str(output), "--apply"])
         with pytest.raises(CliError) as exc:
             args.func(args)
-        assert exc.value.code == EXIT_ENV_ERROR
+        assert exc.value.code == EXIT_BUSY_ERROR
 
     def test_apply_records_a_crashed_activation_on_failure(
         self, env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1108,7 +1109,7 @@ class TestApply:
         output = tmp_path / "clip.mkv"
 
         def _raise_busy(path, kind):
-            raise CliError(EXIT_ENV_ERROR, "busy", remediation="wait")
+            raise CliError(EXIT_BUSY_ERROR, "busy", remediation="wait")
 
         monkeypatch.setattr(record.access, "require_access", _raise_busy)
         monkeypatch.setattr(record.subprocess, "Popen", _RaisingPopen())

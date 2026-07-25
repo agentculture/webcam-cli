@@ -32,7 +32,7 @@ from webcam_cli.access import (
     find_holder,
     require_access,
 )
-from webcam_cli.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from webcam_cli.cli._errors import EXIT_BUSY_ERROR, EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
 # --- public-API shape (locked: later tasks are written against this) ------
 
@@ -260,7 +260,8 @@ def test_check_access_busy_names_holder_when_determinable(
     assert report.holder == Holder(pid=4242, command="zoom")
     assert "zoom" in report.remediation
     assert "4242" in report.remediation
-    assert access_error(report).code == EXIT_ENV_ERROR
+    # BUSY is the retryable class — distinct from FORBIDDEN/ABSENT, which are not.
+    assert access_error(report).code == EXIT_BUSY_ERROR
 
 
 def test_check_access_busy_degrades_to_unknown_holder(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,7 +327,7 @@ def test_require_access_busy_raises_bounded_and_never_hangs(
     elapsed = time.monotonic() - start
 
     assert elapsed < 1.0
-    assert exc_info.value.code == EXIT_ENV_ERROR
+    assert exc_info.value.code == EXIT_BUSY_ERROR
     assert "cheese" in exc_info.value.remediation
     assert "99" in exc_info.value.remediation
 
@@ -385,6 +386,98 @@ def test_access_error_messages_name_the_path_and_kind() -> None:
     assert "/dev/video3" in err.message
     assert "video" in err.message
     assert err.remediation == "fix it"
+
+
+# --- access_error: exit-code policy -----------------------------------------
+#
+# BUSY is retryable (another process will eventually release the device);
+# FORBIDDEN and ABSENT are not (they need a human/config fix, not a wait).
+# An agent that gets the same exit code for "wait and try again" and "this
+# will never work without a seat ACL" cannot tell the two apart without
+# string-matching the message — exactly what the typed exit code prevents.
+
+
+def test_access_error_busy_returns_the_retryable_exit_code() -> None:
+    report = AccessReport(
+        path="/dev/video0",
+        kind="video",
+        state=AccessState.BUSY,
+        remediation="wait for the holder to release it",
+        holder=Holder(pid=123, command="cheese"),
+    )
+    assert access_error(report).code == EXIT_BUSY_ERROR
+
+
+def test_access_error_forbidden_still_returns_env_error() -> None:
+    report = AccessReport(
+        path="/dev/video0",
+        kind="video",
+        state=AccessState.FORBIDDEN,
+        remediation="join the video group",
+    )
+    assert access_error(report).code == EXIT_ENV_ERROR
+
+
+def test_access_error_absent_still_returns_user_error() -> None:
+    report = AccessReport(
+        path="/dev/video0",
+        kind="video",
+        state=AccessState.ABSENT,
+        remediation="check it is plugged in",
+    )
+    assert access_error(report).code == EXIT_USER_ERROR
+
+
+def test_access_error_busy_forbidden_absent_are_three_distinct_codes() -> None:
+    """The three non-OK states must map to three distinct exit codes.
+
+    Before this fix BUSY and FORBIDDEN shared code 2 — collapsing "retryable"
+    into "not retryable". This asserts all three are now pairwise distinct.
+    """
+    busy = AccessReport(path="/p", kind="video", state=AccessState.BUSY, remediation="r")
+    forbidden = AccessReport(path="/p", kind="video", state=AccessState.FORBIDDEN, remediation="r")
+    absent = AccessReport(path="/p", kind="video", state=AccessState.ABSENT, remediation="r")
+
+    codes = {
+        access_error(busy).code,
+        access_error(forbidden).code,
+        access_error(absent).code,
+    }
+    assert codes == {EXIT_BUSY_ERROR, EXIT_ENV_ERROR, EXIT_USER_ERROR}
+
+
+def test_access_error_busy_preserves_holder_naming_in_message() -> None:
+    """The exit-code fix must not disturb the existing holder-naming behavior."""
+    report = AccessReport(
+        path="/dev/video0",
+        kind="video",
+        state=AccessState.BUSY,
+        remediation="stop that process, then retry",
+        holder=Holder(pid=4242, command="zoom"),
+    )
+    err = access_error(report)
+    assert err.code == EXIT_BUSY_ERROR
+    assert "zoom" in err.message
+    assert "4242" in err.message
+
+
+def test_access_error_busy_json_payload_shape_is_unchanged() -> None:
+    """The stable {code, message, remediation} shape must not gain a key.
+
+    A distinct BUSY exit code is a value change, not a shape change — a
+    consumer parsing the JSON error contract must not have to learn a new
+    field just because BUSY became retryable.
+    """
+    report = AccessReport(
+        path="/dev/video0",
+        kind="video",
+        state=AccessState.BUSY,
+        remediation="stop that process, then retry",
+        holder=Holder(pid=4242, command="zoom"),
+    )
+    payload = access_error(report).to_dict()
+    assert set(payload.keys()) == {"code", "message", "remediation"}
+    assert payload["code"] == EXIT_BUSY_ERROR
 
 
 # --- find_holder: /proc scanning and graceful degradation ------------------
@@ -523,7 +616,7 @@ def test_busy_error_names_the_holder(monkeypatch: pytest.MonkeyPatch) -> None:
 
     err = access.busy_error("/dev/video0", "video")
 
-    assert err.code == EXIT_ENV_ERROR
+    assert err.code == EXIT_BUSY_ERROR
     assert "/dev/video0" in err.message
     assert "busy" in err.message
     assert "pid 4242" in err.message
@@ -535,7 +628,7 @@ def test_busy_error_degrades_when_the_holder_is_unknown(monkeypatch: pytest.Monk
 
     err = access.busy_error("/dev/video0", "video")
 
-    assert err.code == EXIT_ENV_ERROR
+    assert err.code == EXIT_BUSY_ERROR
     assert "could not be identified" in err.remediation
 
 

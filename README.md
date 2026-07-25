@@ -43,7 +43,7 @@ The console command is `webcam`. The import package is `webcam_cli` and the PyPI
 | `doctor` | Check the agent-identity invariants (prompt-file-present, backend-consistency). |
 | `cli overview` | Describe the CLI surface itself. |
 
-Every command supports `--json`. Results go to stdout, errors/diagnostics to stderr (never mixed). Exit codes: `0` success, `1` user error, `2` environment error, `3+` reserved.
+Every command supports `--json`. Results go to stdout, errors/diagnostics to stderr (never mixed). Exit codes: `0` success, `1` user error, `2` environment error (not retryable), `3` device busy (retryable), `4+` reserved.
 
 ## What switches the camera on
 
