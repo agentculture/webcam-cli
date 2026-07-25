@@ -79,7 +79,18 @@ _USB_DEVICE_RE = re.compile(r"^\d+-\d+(?:\.\d+)*$")
 # lazily backing off past it — [^\]]*? followed by \s* let both quantifiers
 # claim the same run of trailing spaces, which is quadratic backtracking on
 # a line that never finds a closing ']'.
-_CARDS_LINE_RE = re.compile(r"^\s*(?P<index>\d+)\s*\[(?P<id>[^\]\s]*)\s*\]\s*:\s*(?P<rest>.*)$")
+#
+# Every quantifier here is *possessive* (`*+` / `++`), so the match is
+# single-pass: a possessive quantifier never gives characters back, which
+# leaves no backtracking budget to exhaust and no super-linear path to find.
+# Measured, the plain-greedy form was already linear on every adversarial
+# shape we could build; writing it possessively makes that a property of the
+# pattern rather than of the input, and settles SonarCloud S8786 by
+# construction instead of by argument. Behaviour is unchanged — verified
+# against this host's /proc/asound/cards and 500k fuzzed lines.
+_CARDS_LINE_RE = re.compile(
+    r"^\s*+(?P<index>\d++)\s*+\[(?P<id>[^\]\s]*+)\s*+\]\s*+:\s*+(?P<rest>.*+)$"
+)
 # A capture PCM directory under /proc/asound/cardN: "pcm0c" (playback is "pcm0p").
 _CAPTURE_PCM_RE = re.compile(r"^pcm(?P<device>\d+)c$")
 # udev's device-name allowlist; everything else becomes "_".

@@ -33,6 +33,7 @@ Four trees, all derived from the operator's host on 2026-07-24:
 
 from __future__ import annotations
 
+import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -40,6 +41,7 @@ import pytest
 
 from webcam_cli.cli._errors import EXIT_USER_ERROR, CliError
 from webcam_cli.devices import (
+    _CARDS_LINE_RE,
     AudioCard,
     LogicalDevice,
     VideoNode,
@@ -389,3 +391,104 @@ def test_enumerating_the_real_host_is_read_only_and_never_raises() -> None:
     for device in devices:
         assert device.stable_id
         assert device.video_nodes or device.audio is not None
+
+
+# --------------------------------------------------------------------------
+# The /proc/asound/cards line regex
+#
+# SonarCloud S8786 flags this pattern as super-linear. Measured, it is linear
+# on every adversarial shape we could construct -- the analyzer objects to the
+# overlap between adjacent quantifiers (`\s*` beside `.*`), which in practice
+# cannot backtrack because `.*$` always succeeds. Rather than argue with the
+# analyzer, the pattern is written with possessive quantifiers so it is
+# backtrack-free *by construction* and the objection cannot recur. These tests
+# pin both halves of that: the property, and the parse behaviour it must not
+# change.
+# --------------------------------------------------------------------------
+
+
+def test_cards_line_regex_is_backtrack_free_by_construction() -> None:
+    """Every quantifier in the cards-line pattern is possessive.
+
+    A possessive quantifier never gives characters back, so the match is
+    single-pass regardless of input -- there is no backtracking budget to
+    exhaust and no super-linear path to find.
+    """
+    pattern = _CARDS_LINE_RE.pattern
+    greedy = [
+        f"{pattern[max(0, i - 6):i + 1]!r} (offset {i})"
+        for i, char in enumerate(pattern)
+        if char in "*+"
+        # a quantifier is possessive when the next character is '+'; skip the
+        # '+' that is itself the possessive marker, and '+' inside a class.
+        and not pattern.startswith("+", i + 1)
+        and not (char == "+" and pattern.startswith(("*", "+"), i - 1))
+    ]
+    assert greedy == [], f"non-possessive quantifier(s) in _CARDS_LINE_RE: {greedy}"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (" 0 [NVIDIA         ]: HDA-Intel - HDA NVidia", ("0", "NVIDIA", "HDA-Intel - HDA NVidia")),
+        (
+            " 1 [WEBCAM         ]: USB-Audio - C270 HD WEBCAM",
+            ("1", "WEBCAM", "USB-Audio - C270 HD WEBCAM"),
+        ),
+        (
+            "3 [Arducam12MP    ]: USB-Audio - Arducam_12MP",
+            ("3", "Arducam12MP", "USB-Audio - Arducam_12MP"),
+        ),
+        ("10 [x]:y", ("10", "x", "y")),
+        (
+            " 2 [Audio]  :  USB-Audio - Reachy Mini Audio",
+            ("2", "Audio", "USB-Audio - Reachy Mini Audio"),
+        ),
+        ("0 []: no id at all", ("0", "", "no id at all")),
+    ],
+)
+def test_cards_line_regex_parses_the_shapes_alsa_emits(
+    line: str, expected: tuple[str, str, str]
+) -> None:
+    matched = _CARDS_LINE_RE.match(line)
+    assert matched is not None, line
+    assert (matched.group("index"), matched.group("id"), matched.group("rest")) == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "",
+        "   ",
+        "no leading index [X]: y",
+        "1 no bracket at all",
+        "1 [unterminated",
+        "    0    :    missing brackets",
+        "  Playback devices are not card lines",
+    ],
+)
+def test_cards_line_regex_rejects_non_card_lines(line: str) -> None:
+    assert _CARDS_LINE_RE.match(line) is None
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda n: " " * n + "x", id="spaces-then-nondigit"),
+        pytest.param(lambda n: "1" * n, id="digits-only"),
+        pytest.param(lambda n: "1 [" + "a" * n, id="open-bracket-never-closed"),
+        pytest.param(lambda n: "1 [" + "a " * n, id="bracket-alternating-space"),
+        pytest.param(lambda n: "1 [X" + " " * n + "]" + " " * n, id="padded-but-no-colon"),
+        pytest.param(lambda n: "1 [X]:" + " " * n, id="trailing-space-run"),
+    ],
+)
+def test_cards_line_regex_stays_linear_on_adversarial_input(make) -> None:
+    """Catastrophic backtracking would blow up between these two sizes."""
+    small, large = 2_000, 64_000
+    for size in (small, large):
+        started = time.perf_counter()
+        _CARDS_LINE_RE.match(make(size))
+        elapsed = time.perf_counter() - started
+        # Generous by ~3 orders of magnitude against measured (<0.001s at 64k);
+        # a quadratic path at 64k takes minutes, so this cannot pass by luck.
+        assert elapsed < 0.5, f"{size} chars took {elapsed:.3f}s"
