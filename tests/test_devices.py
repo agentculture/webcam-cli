@@ -495,7 +495,8 @@ def test_cards_line_regex_parses_the_shapes_alsa_emits(
 ) -> None:
     matched = _CARDS_LINE_RE.match(line)
     assert matched is not None, line
-    assert (matched.group("index"), matched.group("id"), matched.group("rest")) == expected
+    actual = (matched.group("index"), matched.group("id"), matched.group("rest"))
+    assert actual == expected
 
 
 @pytest.mark.parametrize(

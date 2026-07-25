@@ -970,8 +970,9 @@ class TestPortArgparseValidation:
     def test_invalid_port_rejected_as_user_error_with_hint(
         self, raw: str, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        parser = _parser()
         with pytest.raises(SystemExit) as exc:
-            _parser().parse_args(["stream", "video", "c270", "--port", raw])
+            parser.parse_args(["stream", "video", "c270", "--port", raw])
         assert exc.value.code == EXIT_USER_ERROR
         err = capsys.readouterr().err
         assert err.startswith("error:")
@@ -988,8 +989,9 @@ class TestPortArgparseValidation:
 
 def test_port_70000_end_to_end_is_exit_1_with_a_hint(capsys: pytest.CaptureFixture[str]) -> None:
     """The exact scenario from the review finding, run through the real CLI."""
+    parser = _parser()
     with pytest.raises(SystemExit) as exc:
-        _parser().parse_args(["stream", "video", "c270", "--port", "70000"])
+        parser.parse_args(["stream", "video", "c270", "--port", "70000"])
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert err.startswith("error:")
