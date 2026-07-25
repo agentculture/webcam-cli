@@ -104,7 +104,8 @@ def cli_sections() -> list[dict[str, object]]:
             "items": [
                 "every command supports --json",
                 "results to stdout, errors/diagnostics to stderr (never mixed)",
-                "exit codes: 0 success, 1 user error, 2 environment error, 3+ reserved",
+                "exit codes: 0 success, 1 user error, 2 environment error, "
+                "3 device busy (retryable), 4+ reserved",
                 "writes and hardware activation are opt-in: --apply commits, --probe opens "
                 "the camera to enumerate formats, and the default is a dry run",
             ],
