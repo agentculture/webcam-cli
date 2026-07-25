@@ -224,15 +224,35 @@ def test_every_registered_path_has_a_catalog_entry() -> None:
     assert not undocumented, f"registered but not in the explain catalog: {undocumented}"
 
 
-def test_every_registered_verb_appears_in_overview() -> None:
-    """`overview._VERBS` is a hand-maintained duplicate of the surface."""
+_WORD_RE = re.compile(r"[a-zA-Z]+")
+
+
+def _word_tokens(text: str) -> set[str]:
+    return set(_WORD_RE.findall(text.lower()))
+
+
+def test_every_registered_path_appears_in_overview_verbs() -> None:
+    """`overview._VERBS` is a hand-maintained duplicate of the surface.
+
+    Mirrors :func:`test_every_registered_path_has_a_catalog_entry`: walk the
+    *live* parser tree (recursively, so noun-group sub-verbs like
+    ``stream overview`` and ``cli overview`` are included) and require every
+    path to be represented in ``_VERBS``. "Represented" means some single
+    entry's word-tokens are a superset of the path's components -- e.g. the
+    existing ``stream video|audio|av <device>`` line covers three leaf verbs
+    at once via that shorthand. A path with no such entry (an entirely
+    missing noun like ``cli``, or an undocumented sub-verb like
+    ``stream overview``) fails loudly instead of drifting silently, which is
+    exactly the gap a hand-maintained duplicate can develop over time.
+    """
     from webcam_cli.cli._commands.overview import _VERBS
 
-    listed = " ".join(_VERBS)
-    for (top, *_rest) in {p[:1] for p in _registered_paths()}:
-        if top == "cli":
-            continue  # described by its own `cli overview`, not the agent rollup
-        assert top in listed, f"`{top}` is registered but missing from overview._VERBS"
+    entry_tokens = [_word_tokens(entry) for entry in _VERBS]
+    for path in _registered_paths():
+        wanted = set(path)
+        assert any(
+            wanted <= tokens for tokens in entry_tokens
+        ), f"`{' '.join(path)}` is registered but not represented in overview._VERBS"
 
 
 # --- the command an agent is told to type ---------------------------------
