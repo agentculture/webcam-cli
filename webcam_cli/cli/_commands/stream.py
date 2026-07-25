@@ -84,6 +84,7 @@ Zero runtime dependencies: standard library only.
 from __future__ import annotations
 
 import argparse
+import errno
 import re
 import shlex
 import signal
@@ -113,6 +114,11 @@ STREAM_HOST = "127.0.0.1"
 #: Canonical default port. Fixed rather than random so a dry-run plan is
 #: concrete and reproducible; ``--port 0`` auto-picks a free port instead.
 DEFAULT_PORT = 5000
+
+#: Ports below this need root privileges on most systems (POSIX convention,
+#: not something this tool enforces). Used only to make an EACCES/EPERM bind
+#: failure's remediation concrete rather than generic.
+_PRIVILEGED_PORT_CEILING = 1024
 
 #: The GStreamer sink that serves the attachment point (see module docstring).
 SINK_ELEMENT = "tcpserversink"
@@ -485,19 +491,77 @@ def _free_port() -> int:
         ) from exc
 
 
-def _require_free_port(port: int) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((STREAM_HOST, port))
-    except OSError as exc:
-        raise CliError(
+def _port_permission_remediation(port: int) -> str:
+    if port < _PRIVILEGED_PORT_CEILING:
+        return (
+            f"ports below {_PRIVILEGED_PORT_CEILING} need root privileges on most systems "
+            f"— pass --port with a value >= {_PRIVILEGED_PORT_CEILING}, or --port 0 to "
+            "auto-pick a free unprivileged one"
+        )
+    return (
+        "this process is not permitted to bind that port on this host — check its "
+        "network/socket permissions (e.g. a restrictive seccomp/AppArmor profile), or "
+        "pass --port 0 to auto-pick a free one"
+    )
+
+
+def _bind_error(port: int, exc: OSError) -> CliError:
+    """Type a failed ``bind()`` by its actual ``errno`` — never assume conflict.
+
+    Collapsing every bind failure into "already in use" misdirects the fix: an
+    agent handed that message for what is actually a permission or address
+    problem will retry forever on a different port and never succeed. Each
+    branch below names the failure it actually is and points at a fix that can
+    work.
+    """
+    if exc.errno == errno.EADDRINUSE:
+        return CliError(
             EXIT_ENV_ERROR,
             f"attachment port {port} on {STREAM_HOST} is already in use",
             remediation=(
                 "pass --port <N> to serve on another port, or --port 0 to auto-pick a "
                 "free one; a stream already running from this tool is the usual holder"
             ),
+        )
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return CliError(
+            EXIT_ENV_ERROR,
+            f"not permitted to bind port {port} on {STREAM_HOST}: {exc.strerror or exc}",
+            remediation=_port_permission_remediation(port),
+        )
+    if exc.errno == errno.EADDRNOTAVAIL:
+        return CliError(
+            EXIT_ENV_ERROR,
+            f"{STREAM_HOST} is not available on this host for port {port}: "
+            f"{exc.strerror or exc}",
+            remediation=(
+                "the loopback address could not be bound on this host — check its "
+                "network configuration, or pass --port 0 to auto-pick a free one"
+            ),
+        )
+    return CliError(
+        EXIT_ENV_ERROR,
+        f"could not bind port {port} on {STREAM_HOST}: {exc.strerror or exc}",
+        remediation="pass a different --port, or --port 0 to auto-pick a free one",
+    )
+
+
+def _require_free_port(port: int) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((STREAM_HOST, port))
+    except OSError as exc:
+        raise _bind_error(port, exc) from exc
+    except (OverflowError, ValueError) as exc:
+        # Reachable only when this function is called directly with a value
+        # the argparse `type=` validator (_port_type) never let through — an
+        # out-of-range int must still come back typed, not as a raw
+        # traceback.
+        raise CliError(
+            EXIT_USER_ERROR,
+            f"--port {port} is not a valid port number: {exc}",
+            remediation="pass an integer --port between 0 and 65535 (0 auto-picks a free one)",
         ) from exc
     finally:
         sock.close()
@@ -1428,6 +1492,24 @@ _HARDWARE_EPILOG = (
 )
 
 
+def _port_type(raw: str) -> int:
+    """argparse ``type=`` for ``--port``: a whole number in ``[0, 65535]``.
+
+    Rejecting the range here means a bad value never reaches
+    :func:`_require_free_port` or ``socket.bind`` from the CLI at all — those
+    only see it when called directly (e.g. from a test).
+    """
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid --port {raw!r}: must be a whole number") from exc
+    if not 0 <= value <= 65535:
+        raise argparse.ArgumentTypeError(
+            f"invalid --port {raw!r}: must be between 0 and 65535 (0 auto-picks a free port)"
+        )
+    return value
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "device",
@@ -1449,11 +1531,11 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--port",
-        type=int,
+        type=_port_type,
         default=DEFAULT_PORT,
         metavar="N",
         help=f"Loopback port for the attachment point (default {DEFAULT_PORT}; "
-        "0 auto-picks a free port).",
+        "0 auto-picks a free port; must be 0-65535).",
     )
 
 
