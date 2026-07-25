@@ -36,20 +36,39 @@ def _which_both_present(name: str) -> str | None:
     return None
 
 
-def _make_inspect_run(missing: set[str]) -> "callable":
-    """Build a fake subprocess.run for `gst-inspect-1.0 <element>` probes.
+def _make_inspect_run(missing: set[str], supports_exists: bool = True) -> "callable":
+    """Build a fake subprocess.run for `gst-inspect-1.0` probes.
 
-    Mirrors real gst-inspect-1.0 behaviour observed on-host: exit 0 with
-    element details on stdout when present, exit 255 with
-    "No such element or plugin '<name>'" on stderr when absent.
+    Mirrors real gst-inspect-1.0 behaviour observed on-host (verified by
+    strace against a live gst-inspect-1.0 1.24.2 during this fix):
+
+    * ``--help`` always exits 0; its stdout advertises ``--exists`` when
+      ``supports_exists`` is True (a modern gst-inspect-1.0), and omits it
+      when False (simulating one old enough to predate the flag).
+    * ``--exists <element>`` exits 0 when present, 1 when absent, with no
+      stdout/stderr detail.
+    * the plain form ``<element>`` exits 0 with details on stdout when
+      present, exit 255 with "No such element or plugin '<name>'" on stderr
+      when absent.
     """
 
     def _run(argv, **kwargs):  # noqa: ANN001 - test double, signature mirrors subprocess.run
+        if argv[1:] == ["--help"]:
+            help_text = "Usage:\n  gst-inspect-1.0 [OPTION...]\n\nHelp Options:\n"
+            if supports_exists:
+                help_text += "  --exists   Check if the specified element or plugin exists\n"
+            return _FakeCompletedProcess(returncode=0, stdout=help_text)
+
         element = argv[-1]
+        uses_exists = "--exists" in argv
         if element in missing:
+            if uses_exists:
+                return _FakeCompletedProcess(returncode=1)
             return _FakeCompletedProcess(
                 returncode=255, stderr=f"No such element or plugin '{element}'\n"
             )
+        if uses_exists:
+            return _FakeCompletedProcess(returncode=0)
         return _FakeCompletedProcess(returncode=0, stdout=f"Factory Details:\n  ... {element}\n")
 
     return _run
@@ -238,6 +257,174 @@ def test_detect_survives_oserror_from_inspect_probe(monkeypatch):
 
     assert all(present is False for present in cap.plugins.values())
     assert cap.available is False
+
+
+# --- _element_present() -------------------------------------------------------
+#
+# gst-inspect-1.0's *plain* element-name form opens every /dev/video* node on
+# the host as a side effect of its own introspection (strace-verified against
+# a live gst-inspect-1.0 1.24.2 during this fix: `gst-inspect-1.0 v4l2src`
+# opened /dev/video0 through /dev/video3). Since detect() runs unconditionally
+# from record's no-flag dry-run path, that silently broke the "dry-run opens
+# nothing" consent guarantee. `--exists` was independently verified (strace,
+# all 13 elements this module probes) to open zero /dev/video*/ /dev/snd
+# nodes, so it is now the primary probe; the plain form survives only as a
+# fallback for a gst-inspect-1.0 old enough to predate the flag.
+
+
+def test_element_present_probes_with_exists_flag(monkeypatch):
+    captured: list[list[str]] = []
+
+    def _run(argv, **kwargs):  # noqa: ANN001
+        captured.append(argv)
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(engine.subprocess, "run", _run)
+
+    result = engine._element_present("/usr/bin/gst-inspect-1.0", "v4l2src", use_exists=True)
+
+    assert result is True
+    assert captured == [["/usr/bin/gst-inspect-1.0", "--exists", "v4l2src"]]
+
+
+def test_element_present_true_for_present_element_via_exists(monkeypatch):
+    monkeypatch.setattr(engine.subprocess, "run", _make_inspect_run(missing=set()))
+
+    assert engine._element_present("gst-inspect-1.0", "v4l2src", use_exists=True) is True
+
+
+def test_element_present_false_for_absent_element_via_exists(monkeypatch):
+    monkeypatch.setattr(engine.subprocess, "run", _make_inspect_run(missing={"x264enc"}))
+
+    assert engine._element_present("gst-inspect-1.0", "x264enc", use_exists=True) is False
+
+
+def test_element_present_oserror_returns_false_not_crash(monkeypatch):
+    def _raise(*_a, **_kw):
+        raise OSError("boom")
+
+    monkeypatch.setattr(engine.subprocess, "run", _raise)
+
+    assert engine._element_present("gst-inspect-1.0", "v4l2src", use_exists=True) is False
+
+
+def test_element_present_timeout_returns_false_not_crash(monkeypatch):
+    def _raise(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd="gst-inspect-1.0", timeout=10)
+
+    monkeypatch.setattr(engine.subprocess, "run", _raise)
+
+    assert engine._element_present("gst-inspect-1.0", "v4l2src", use_exists=True) is False
+
+
+def test_element_present_falls_back_to_plain_form_when_exists_unsupported(monkeypatch):
+    captured: list[list[str]] = []
+
+    def _run(argv, **kwargs):  # noqa: ANN001
+        captured.append(argv)
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(engine.subprocess, "run", _run)
+
+    result = engine._element_present("/usr/bin/gst-inspect-1.0", "v4l2src", use_exists=False)
+
+    assert result is True
+    assert captured == [["/usr/bin/gst-inspect-1.0", "v4l2src"]]
+    assert "--exists" not in captured[0]
+
+
+# --- detect() / --exists support detection -----------------------------------
+
+
+def test_detect_probes_element_presence_with_exists_flag(monkeypatch):
+    captured: list[list[str]] = []
+
+    def _run(argv, **kwargs):  # noqa: ANN001
+        captured.append(list(argv))
+        if argv[1:] == ["--help"]:
+            return _FakeCompletedProcess(returncode=0, stdout="Help Options:\n  --exists   check\n")
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(engine.subprocess, "run", _run)
+
+    engine.detect()
+
+    element_calls = [argv for argv in captured if argv[1:] != ["--help"]]
+    assert element_calls, "expected per-element probe calls"
+    assert all("--exists" in argv for argv in element_calls)
+
+
+def test_detect_checks_exists_support_once_not_per_element(monkeypatch):
+    help_calls = 0
+
+    def _run(argv, **kwargs):  # noqa: ANN001
+        nonlocal help_calls
+        if argv[1:] == ["--help"]:
+            help_calls += 1
+            return _FakeCompletedProcess(returncode=0, stdout="Help Options:\n  --exists   check\n")
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(engine.subprocess, "run", _run)
+
+    engine.detect()
+
+    assert help_calls == 1
+
+
+def test_detect_falls_back_to_plain_form_when_exists_flag_unsupported(monkeypatch):
+    """A gst-inspect-1.0 predating --exists must not be reported as a missing engine."""
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(
+        engine.subprocess, "run", _make_inspect_run(missing=set(), supports_exists=False)
+    )
+
+    cap = engine.detect()
+
+    # The whole point of the fallback: real, present elements must still be
+    # reported present, and the engine must still be reported available --
+    # never silently downgraded to "engine missing" by a flag-support gap.
+    assert cap.plugins["v4l2src"] is True
+    assert cap.plugins["alsasrc"] is True
+    assert cap.plugins["matroskamux"] is True
+    assert cap.available is True
+
+
+def test_detect_fallback_plain_form_still_detects_missing_elements(monkeypatch):
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(
+        engine.subprocess,
+        "run",
+        _make_inspect_run(missing={"x264enc"}, supports_exists=False),
+    )
+
+    cap = engine.detect()
+
+    assert cap.plugins["x264enc"] is False
+    assert cap.plugins["v4l2src"] is True
+    assert cap.available is True
+
+
+def test_detect_exists_support_probe_oserror_falls_back_without_crash(monkeypatch):
+    """--help itself failing to run must degrade to the fallback, not crash."""
+    calls: list[list[str]] = []
+
+    def _run(argv, **kwargs):  # noqa: ANN001
+        calls.append(list(argv))
+        if argv[1:] == ["--help"]:
+            raise OSError("boom")
+        return _FakeCompletedProcess(returncode=0, stdout="Factory Details:\n")
+
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(engine.subprocess, "run", _run)
+
+    cap = engine.detect()
+
+    assert cap.plugins["v4l2src"] is True
+    assert cap.available is True
+    element_calls = [argv for argv in calls if argv[1:] != ["--help"]]
+    assert all("--exists" not in argv for argv in element_calls)
 
 
 # --- require_engine() --------------------------------------------------------
