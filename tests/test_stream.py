@@ -31,6 +31,7 @@ structured exit-1 contract.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import socket
 import sys
@@ -856,6 +857,153 @@ def test_a_port_already_in_use_is_a_typed_error_naming_the_fix(
         assert "--port" in exc.value.remediation
     finally:
         holder.close()
+
+
+# --- port bind failures: errno must drive the message, never a blanket ------
+# --- "already in use" claim (Qodo bug/correctness finding) ------------------
+
+
+def _raise_bind_errno(code: int, text: str):
+    def _bind(self: socket.socket, addr: tuple[str, int]) -> None:
+        raise OSError(code, text)
+
+    return _bind
+
+
+def test_eaddrinuse_still_reports_already_in_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        socket.socket, "bind", _raise_bind_errno(errno.EADDRINUSE, "Address already in use")
+    )
+    with pytest.raises(CliError) as exc:
+        stream._require_free_port(5000)
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "already in use" in exc.value.message
+    assert "--port" in exc.value.remediation
+
+
+def test_eacces_is_a_permission_failure_not_a_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket.socket, "bind", _raise_bind_errno(errno.EACCES, "Permission denied"))
+    with pytest.raises(CliError) as exc:
+        stream._require_free_port(80)
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "already in use" not in exc.value.message
+    assert "permitted" in exc.value.message.lower() or "permission" in exc.value.message.lower()
+    # A privileged port (<1024) needs root — the remediation must say so, not
+    # send the agent to retry the same doomed bind on a different port.
+    assert "root" in exc.value.remediation or "1024" in exc.value.remediation
+
+
+def test_eperm_is_also_a_permission_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        socket.socket, "bind", _raise_bind_errno(errno.EPERM, "Operation not permitted")
+    )
+    with pytest.raises(CliError) as exc:
+        stream._require_free_port(443)
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "already in use" not in exc.value.message
+
+
+def test_eaddrnotavail_names_the_real_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        socket.socket,
+        "bind",
+        _raise_bind_errno(errno.EADDRNOTAVAIL, "Cannot assign requested address"),
+    )
+    with pytest.raises(CliError) as exc:
+        stream._require_free_port(6000)
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "already in use" not in exc.value.message
+    assert "not available" in exc.value.message
+
+
+def test_unmapped_errno_reports_the_real_error_text_not_a_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(socket.socket, "bind", _raise_bind_errno(errno.ENETDOWN, "Network is down"))
+    with pytest.raises(CliError) as exc:
+        stream._require_free_port(6000)
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "already in use" not in exc.value.message
+    assert "Network is down" in exc.value.message
+
+
+def test_non_oserror_bind_failure_is_typed_never_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_require_free_port`` is callable directly, bypassing the argparse
+
+    ``type=`` guard — an out-of-range int handed to it straight must still
+    come back as a typed ``CliError``, never an unhandled ``OverflowError``.
+    """
+
+    def _bind(self: socket.socket, addr: tuple[str, int]) -> None:
+        raise OverflowError("bind(): port must be 0-65535.")
+
+    monkeypatch.setattr(socket.socket, "bind", _bind)
+    with pytest.raises(CliError) as exc:
+        stream._require_free_port(700000)
+    assert exc.value.code == EXIT_USER_ERROR
+
+
+def test_eacces_end_to_end_through_apply_is_not_reported_as_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same errno branch, exercised through the full ``--apply`` CLI path."""
+    _apply_ready(monkeypatch)
+    monkeypatch.setattr(socket.socket, "bind", _raise_bind_errno(errno.EACCES, "Permission denied"))
+    with pytest.raises(CliError) as exc:
+        _run(["stream", "video", "c270", "--apply", "--port", "80"])
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert "already in use" not in exc.value.message
+
+
+# --- --port argparse validation ----------------------------------------------
+
+
+class TestPortArgparseValidation:
+    """``--port`` must reject out-of-range/non-numeric values before dispatch,
+    through the same structured exit-1 contract every other parse error uses
+    (never argparse's raw exit 2)."""
+
+    @pytest.mark.parametrize("raw", ["70000", "-1", "99999", "65536", "abc"])
+    def test_invalid_port_rejected_as_user_error_with_hint(
+        self, raw: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            _parser().parse_args(["stream", "video", "c270", "--port", raw])
+        assert exc.value.code == EXIT_USER_ERROR
+        err = capsys.readouterr().err
+        assert err.startswith("error:")
+        assert "hint:" in err
+
+    def test_port_zero_is_accepted(self) -> None:
+        args = _parser().parse_args(["stream", "video", "c270", "--port", "0"])
+        assert args.port == 0
+
+    def test_port_65535_is_the_valid_upper_bound(self) -> None:
+        args = _parser().parse_args(["stream", "video", "c270", "--port", "65535"])
+        assert args.port == 65535
+
+
+def test_port_70000_end_to_end_is_exit_1_with_a_hint(capsys: pytest.CaptureFixture[str]) -> None:
+    """The exact scenario from the review finding, run through the real CLI."""
+    with pytest.raises(SystemExit) as exc:
+        _parser().parse_args(["stream", "video", "c270", "--port", "70000"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "hint:" in err
+
+
+def test_port_zero_still_auto_picks_a_free_port() -> None:
+    """``--port 0`` must keep going through ``_free_port`` — not the new
+
+    argparse validator, and not the errno-branched bind path — and get back a
+    real, usable port.
+    """
+    port, source = stream._port(argparse.Namespace(port=0), apply_mode=True)
+    assert isinstance(port, int) and port > 0
+    assert "auto-pick" in source
 
 
 # --- criterion 4: warm-up ---------------------------------------------------
