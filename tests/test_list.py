@@ -168,7 +168,7 @@ def test_json_schema_carries_stable_id_nodes_card_and_mic(
     assert [n["path"] for n in c270["video_nodes"]] == ["/dev/video0", "/dev/video1"]
     assert c270["video_nodes"][0]["by_id"] == f"/dev/v4l/by-id/{C270_ID}-video-index0"
     assert c270["video_nodes"][0]["index"] == 0
-    assert c270["capture_node"] == "/dev/video0"
+    assert c270["capture_node"] == f"/dev/v4l/by-id/{C270_ID}-video-index0"
     assert c270["capture_node_is_heuristic"] is True
     assert c270["audio"]["alsa_address"] == "hw:CARD=WEBCAM,DEV=0"
     assert c270["audio"]["card_id"] == "WEBCAM"
@@ -268,8 +268,9 @@ def test_absent_and_forbidden_are_distinguishable_in_the_payload(
     assert c270["video_access"]["state"] != "forbidden"
     assert "does not exist" in c270["video_access"]["remediation"]
     # check_access was probed on the capture node specifically, not a guess.
-    assert "/dev/video0" in calls
-    assert "/dev/video1" not in calls  # the non-capture node is never probed
+    assert f"/dev/v4l/by-id/{C270_ID}-video-index0" in calls
+    # the non-capture node is never probed
+    assert f"/dev/v4l/by-id/{C270_ID}-video-index1" not in calls
 
 
 def test_busy_state_passes_through_with_holder_named_in_remediation(
@@ -369,7 +370,9 @@ def test_renumbered_tree_keeps_the_same_stable_ids(
 
     assert {d["stable_id"] for d in report["devices"]} == {C270_ID, ARDUCAM_ID, REACHY_ID}
     c270 = _by_id(report)[C270_ID]
-    assert c270["capture_node"] == "/dev/video2"  # moved, but the id did not
+    # The numeric node moved; the capture target is the by-id handle, so it did not.
+    assert c270["video_nodes"][0]["path"] == "/dev/video2"
+    assert c270["capture_node"] == f"/dev/v4l/by-id/{C270_ID}-video-index0"
 
 
 # ---------------------------------------------------------------------------

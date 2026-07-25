@@ -387,6 +387,22 @@ def _claim_microphone(cards: list[_RawCard], usb_dir: str | None) -> AudioCard |
     return None
 
 
+def _capture_target(node: VideoNode) -> str:
+    """The path anything opening this node must use.
+
+    Always the ``/dev/v4l/by-id`` link when there is one: ``/dev/videoN``
+    numbering is plug-order, not identity, and it has already moved on the
+    reference host between two enumerations of the same two cameras. The
+    by-id link carries vendor, product and serial, so it survives that.
+
+    Enumeration is driven by ``/dev/v4l/by-id`` in the first place, so a node
+    without a link should not reach here; the fallback exists so a degraded
+    tree degrades to the old behaviour rather than to ``None``. The numeric
+    path stays visible under ``video_nodes[].path`` either way.
+    """
+    return node.by_id or node.path
+
+
 def _camera(group: list[_RawNode], cards: list[_RawCard]) -> LogicalDevice:
     nodes = sorted(group, key=lambda raw: (raw.node.index, raw.node.path))
     usb_dir = next((raw.usb_dir for raw in nodes if raw.usb_dir), None)
@@ -399,7 +415,9 @@ def _camera(group: list[_RawNode], cards: list[_RawCard]) -> LogicalDevice:
         video_nodes=tuple(raw.node for raw in nodes),
         # No sysfs attribute reports which node yields frames; the lowest
         # -video-indexN is the convention and holds for every UVC device tested.
-        capture_node=nodes[0].node.path,
+        # Reported as the by-id link, never the numeric node — see
+        # _capture_target for why the distinction is load-bearing.
+        capture_node=_capture_target(nodes[0].node),
         audio=_claim_microphone(cards, usb_dir),
     )
 

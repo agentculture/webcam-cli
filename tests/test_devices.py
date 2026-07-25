@@ -33,6 +33,7 @@ Four trees, all derived from the operator's host on 2026-07-24:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -45,6 +46,7 @@ from webcam_cli.devices import (
     AudioCard,
     LogicalDevice,
     VideoNode,
+    _capture_target,
     enumerate_devices,
     resolve,
 )
@@ -54,6 +56,8 @@ BASELINE = str(FIXTURES / "host-baseline")
 RENUMBERED = str(FIXTURES / "host-renumbered")
 CAMERA_ONLY = str(FIXTURES / "camera-only")
 DEGRADED = str(FIXTURES / "degraded")
+
+_NUMERIC_NODE_RE = re.compile(r"^/dev/video\d+$")
 
 C270_ID = "usb-046d_C270_HD_WEBCAM_200901010001"
 ARDUCAM_ID = "usb-Arducam_Technology_Co.__Ltd._Arducam_12MP_SN0001"
@@ -92,8 +96,44 @@ def test_stable_id_is_the_by_id_handle_carrying_the_serial() -> None:
 
 def test_capture_node_is_the_lowest_indexed_node_of_the_pair() -> None:
     devices = by_id(enumerate_devices(root=BASELINE))
-    assert devices[C270_ID].capture_node == "/dev/video0"
-    assert devices[ARDUCAM_ID].capture_node == "/dev/video2"
+    assert devices[C270_ID].capture_node == f"/dev/v4l/by-id/{C270_ID}-video-index0"
+    assert devices[ARDUCAM_ID].capture_node == f"/dev/v4l/by-id/{ARDUCAM_ID}-video-index0"
+
+
+def test_capture_node_is_the_stable_by_id_handle_not_a_plug_order_index() -> None:
+    """The capture target must not be a /dev/videoN path.
+
+    /dev/videoN numbering is plug-order, and it has already moved on this
+    host between two enumerations of the same hardware. Anything that opens
+    a device must go through the by-id link, which carries vendor, product
+    and serial. The numeric node stays visible under `video_nodes[].path`.
+    """
+    for device in enumerate_devices(root=BASELINE):
+        if device.capture_node is None:
+            continue
+        assert device.capture_node.startswith("/dev/v4l/by-id/"), device.capture_node
+        assert not _NUMERIC_NODE_RE.match(device.capture_node), device.capture_node
+
+
+def test_capture_node_does_not_move_when_the_kernel_renumbers() -> None:
+    """The whole point: same hardware, different plug order, same target."""
+    baseline = by_id(enumerate_devices(root=BASELINE))
+    renumbered = by_id(enumerate_devices(root=RENUMBERED))
+    # The numeric node genuinely moved between these two fixture trees...
+    assert baseline[C270_ID].video_nodes[0].path != renumbered[C270_ID].video_nodes[0].path
+    # ...and the capture target did not.
+    assert baseline[C270_ID].capture_node == renumbered[C270_ID].capture_node
+    assert baseline[ARDUCAM_ID].capture_node == renumbered[ARDUCAM_ID].capture_node
+
+
+def test_capture_node_falls_back_to_the_numeric_path_without_a_by_id_link() -> None:
+    node = VideoNode(path="/dev/video9", by_id="", index=0)
+    device = LogicalDevice(
+        stable_id="x", label="x", usb_path="1-1", video_nodes=(node,), capture_node=None
+    )
+    assert device.video_nodes[0].by_id == ""
+    # _capture_target is the single place the preference is expressed.
+    assert _capture_target(node) == "/dev/video9"
 
 
 def test_label_and_usb_path_come_from_usb_descriptors() -> None:
@@ -165,7 +205,7 @@ def test_camera_with_no_sound_subsystem_pairs_to_nothing() -> None:
     assert len(devices) == 1
     assert devices[0].stable_id == C270_ID
     assert devices[0].audio is None
-    assert devices[0].capture_node == "/dev/video0"
+    assert devices[0].capture_node == f"/dev/v4l/by-id/{C270_ID}-video-index0"
     assert len(devices[0].video_nodes) == 2
 
 
@@ -177,7 +217,7 @@ def test_camera_with_no_sound_subsystem_pairs_to_nothing() -> None:
 def test_camera_with_no_sysfs_link_is_still_listed() -> None:
     """Reporting no camera when one is plainly attached is the failure to avoid."""
     device = by_id(enumerate_devices(root=DEGRADED))[C270_ID]
-    assert device.capture_node == "/dev/video0"
+    assert device.capture_node == f"/dev/v4l/by-id/{C270_ID}-video-index0"
     assert device.usb_path == ""  # topology unknown, so honestly reported as unknown
     assert device.audio is None  # ...and with no topology there is nothing to pair
     assert device.label == C270_ID  # no descriptors to build a nicer label from
@@ -216,10 +256,13 @@ def test_renumbering_moves_every_index_but_no_identity() -> None:
     renumbered = by_id(enumerate_devices(root=RENUMBERED))
     assert set(baseline) == set(renumbered)
     # ...and the indices really did move, or this test would prove nothing.
-    assert baseline[C270_ID].capture_node == "/dev/video0"
-    assert renumbered[C270_ID].capture_node == "/dev/video2"
-    assert baseline[ARDUCAM_ID].capture_node == "/dev/video2"
-    assert renumbered[ARDUCAM_ID].capture_node == "/dev/video0"
+    # Read off video_nodes[].path, not capture_node: capture_node is the by-id
+    # handle now and is stable across renumbering *by design*, so asserting on
+    # it here would silently stop proving anything.
+    assert baseline[C270_ID].video_nodes[0].path == "/dev/video0"
+    assert renumbered[C270_ID].video_nodes[0].path == "/dev/video2"
+    assert baseline[ARDUCAM_ID].video_nodes[0].path == "/dev/video2"
+    assert renumbered[ARDUCAM_ID].video_nodes[0].path == "/dev/video0"
 
 
 def test_resolution_by_stable_id_survives_renumbering() -> None:
@@ -367,7 +410,7 @@ def test_as_dict_round_trips_everything_a_json_verb_needs() -> None:
     assert payload["stable_id"] == C270_ID
     assert payload["label"] == "C270 HD WEBCAM"
     assert payload["usb_path"] == "3-1"
-    assert payload["capture_node"] == "/dev/video0"
+    assert payload["capture_node"] == f"/dev/v4l/by-id/{C270_ID}-video-index0"
     assert [node["path"] for node in payload["video_nodes"]] == ["/dev/video0", "/dev/video1"]
     assert payload["audio"]["alsa_address"] == "hw:CARD=WEBCAM,DEV=0"
 
