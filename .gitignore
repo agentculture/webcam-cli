@@ -228,3 +228,18 @@ __marimo__/
 
 # Per-machine skills config (copy from skills.local.yaml.example)
 skills.local.yaml
+
+# devague working state (not committed by default)
+.devague/questions/
+
+.devague/reviews/
+
+# Captured media — never commit. This repo is public and its .eidetic/memory is
+# committed; frames and audio of the operator's room must not leave the host.
+# Acceptance runs write artifacts under $TMPDIR, outside the repo entirely.
+*.mkv
+*.webm
+*.mp4
+*.ogg
+*.wav
+/artifacts/

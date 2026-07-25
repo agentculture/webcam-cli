@@ -15,17 +15,36 @@ def test_overview_text(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["overview"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "# webcam-cli" in out
+    assert out.startswith("# webcam\n")
     assert "Identity" in out
+    # The nick stays `webcam-cli`; only the typed command is `webcam`.
+    assert "nick: webcam-cli" in out
 
 
 def test_overview_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["overview", "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["subject"] == "webcam-cli"
+    assert payload["subject"] == "webcam"
     assert isinstance(payload["sections"], list)
     assert payload["sections"]
+
+
+def test_overview_describes_the_capture_surface_and_its_limits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """overview is agent-facing documentation: it must describe *this* agent."""
+    rc = main(["overview", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    titles = {section["title"] for section in payload["sections"]}
+    assert {"Verbs", "What touches the hardware", "Contracts", "Consent"} <= titles
+
+    body = json.dumps(payload)
+    assert "OPENS the camera" in body
+    assert "/dev/v4l/by-id" in body
+    assert "activation log" in body
+    assert "CANNOT be promised" in body
 
 
 def test_overview_graceful_on_bad_path(capsys: pytest.CaptureFixture[str]) -> None:
@@ -41,14 +60,14 @@ def test_overview_graceful_on_bad_path(capsys: pytest.CaptureFixture[str]) -> No
 def test_cli_overview_text(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["cli", "overview"])
     assert rc == 0
-    assert "# webcam-cli cli" in capsys.readouterr().out
+    assert "# webcam cli" in capsys.readouterr().out
 
 
 def test_cli_overview_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["cli", "overview", "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["subject"] == "webcam-cli cli"
+    assert payload["subject"] == "webcam cli"
     assert isinstance(payload["sections"], list)
 
 
@@ -77,7 +96,7 @@ def test_cli_overview_unknown_flag_structured_error(
 def test_doctor_text(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["doctor"])
     assert rc in (0, 1)
-    assert "webcam-cli doctor" in capsys.readouterr().out
+    assert "webcam doctor" in capsys.readouterr().out
 
 
 def test_doctor_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
