@@ -54,6 +54,10 @@ _CONTRACTS = [
     "'forever'); stream is unbounded by construction (there is no --duration)",
     "an unsupported (format, resolution, fps) is a typed user error naming the "
     "enumerated alternatives — never a silent fallback",
+    "every capture path produces Matroska, never a bare byte stream: record stores MJPG "
+    "untouched as Motion JPEG, encodes a raw pixel format to VP8 and audio to Opus, and "
+    "muxes '--kind av' as the device delivers it; stream serves the same container, with "
+    "--encode choosing the wire codec",
 ]
 
 

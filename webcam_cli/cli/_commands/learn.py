@@ -84,6 +84,21 @@ Bounds
 ceiling 3600s) and no flag combination expresses "forever". `stream` is
 unbounded by construction: there is no --duration; stop it with SIGINT/SIGTERM.
 
+What comes out
+--------------
+Every capture path produces Matroska — a container, not a bare byte stream — so
+the artifact carries its own geometry, frame rate and sample rate and you never
+have to be told them out of band. `record` picks the codec from the negotiated
+source format: an MJPG camera format is carried through as Motion JPEG
+(passthrough, no re-encode), a raw pixel format such as YUYV is encoded to VP8,
+audio is encoded to Opus (so --rate must be one Opus carries: 8000, 12000,
+16000, 24000 or 48000 Hz, and --channels at most 8), and --kind av muxes both
+branches as the device delivers them.
+`stream` serves the same container over tcpserversink, with --encode choosing
+between the device's own format and VP8/Opus on the wire. A missing encoder or
+muxer is a typed environment error naming what to install, never a silent
+fallback to some other format.
+
 Warm-up
 -------
 The first frames off a UVC sensor are unsettled while auto-exposure converges,
@@ -168,6 +183,20 @@ def _as_json_payload() -> dict[str, object]:
             "ceiling 3600s); no flag means 'forever'",
             "stream": "unbounded by construction — there is no --duration; stop with "
             "SIGINT/SIGTERM",
+        },
+        "output_format": {
+            "container": "matroska",
+            "record_video_mjpg": "carried through as Motion JPEG — passthrough, no re-encode",
+            "record_video_raw": "a raw pixel format (YUYV and friends) is encoded to VP8; "
+            "H.264 is not offered because x264enc is absent on the reference host",
+            "record_audio": "encoded to Opus, so --rate must be one Opus carries "
+            "(8000/12000/16000/24000/48000 Hz) and --channels at most 8",
+            "record_av": "both branches muxed as the device delivers them, no per-branch "
+            "re-encode",
+            "stream": "the same container over tcpserversink, with --encode choosing "
+            "between the device's own format and VP8/Opus on the wire",
+            "gating": "a missing encoder or muxer is a typed environment error naming what "
+            "to install, never a silent fallback to another format",
         },
         "exit_codes": {
             "0": "success",

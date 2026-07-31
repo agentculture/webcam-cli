@@ -84,7 +84,11 @@ pipeline builders take a single ``sink`` string each and this module does not
 own that file, warm-up is implemented as a *separate, first* bounded phase of
 the same pipeline shape sunk to ``fakesink`` (discarding frames, writing
 nothing), before the real recording phase opens the device again for the
-bounded recording window.
+bounded recording window. That phase is built with ``mux=False``: it
+reproduces the negotiated source caps exactly — the sensor has to settle at
+the resolution and frame rate it will record at — but appends no container
+tail, because every frame it produces is thrown away and encoding discarded
+pixels to VP8 buys nothing (see :func:`_warmup_pipeline`).
 
 The default is :data:`webcam_cli.engine.DEFAULT_WARMUP_FRAMES` frames
 converted through the **negotiated fps** — the same measured constant
@@ -846,6 +850,62 @@ def _pin_executable(argv: list[str], gst_launch: str | None) -> list[str]:
     return argv
 
 
+#: ``gst-launch-1.0 -e`` — "force EOS on sources before shutting the pipeline
+#: down", which its own ``--help`` recommends "to make sure muxers create
+#: readable files when a muxing pipeline is shut down forcefully via
+#: Control-C". That is exactly this module's stop mechanism: every recording
+#: ends because :func:`_terminate_phase` sends SIGINT at the bound, never
+#: because the source ran out.
+#:
+#: Measured on the reference host, capturing until SIGINT and then reading the
+#: container's own Duration back with ``gst-discoverer-1.0``:
+#:
+#: ==============  ===========  ==========  =====================
+#: route           frames kept  without -e  with -e
+#: ==============  ===========  ==========  =====================
+#: MJPG 1280x960   578          19.224 s    19.298 s   (both fine)
+#: VP8 640x480      63           0.731 s     4.267 s   (only -e is right)
+#: ==============  ===========  ==========  =====================
+#:
+#: The frame count is identical either way — no samples are lost without it —
+#: but on the VP8 route the Duration written into the Segment header is
+#: nonsense, so the artifact still misreports itself to any player or
+#: follow-on tool that reads it. The cost is bounded and small: finalizing a
+#: 51 MB file took ~20 ms, far inside the ``_GRACE_S`` window after which
+#: SIGINT escalates to SIGKILL, so the "never hangs" guarantee is unchanged.
+#:
+#: Not applied to the warm-up phase: it sinks to ``fakesink`` and has no
+#: container to finalize.
+_EOS_ON_SHUTDOWN = "-e"
+
+
+def _with_eos_on_shutdown(argv: list[str]) -> list[str]:
+    """Insert ``-e`` after the binary so SIGINT finalizes the container properly."""
+    if _EOS_ON_SHUTDOWN in argv:
+        return argv
+    return [argv[0], _EOS_ON_SHUTDOWN, *argv[1:]]
+
+
+def _warmup_pipeline(
+    capture_node: str | None, video_fmt: engine.VideoFormat | None, warmup_s: float
+) -> list[str] | None:
+    """The pre-roll pipeline: the same source and caps, sunk straight to ``fakesink``.
+
+    Built with ``mux=False`` on purpose. Warm-up exists to run the sensor
+    until auto-exposure settles and *discard* every frame it produces, so
+    appending the recording pipeline's container tail would encode pixels
+    nothing will ever read — on the raw-video route that is a full VP8 encode
+    per discarded frame. What warm-up has to reproduce faithfully is the
+    negotiated source caps (the sensor settles at the resolution and frame
+    rate it is about to record at), and that half is shared with the real
+    phase because both come from the same builder and the same
+    :class:`~webcam_cli.engine.VideoFormat`.
+    """
+    if warmup_s <= 0:
+        return None
+    return engine.build_video_pipeline(capture_node, video_fmt, "fakesink", mux=False)
+
+
 def _build_pipelines(
     kind: str,
     capture_node: str | None,
@@ -854,27 +914,56 @@ def _build_pipelines(
     audio_fmt: engine.AudioFormat | None,
     sink: str,
     warmup_s: float,
+    cap: engine.Capability | None = None,
 ) -> tuple[list[str], list[str] | None]:
     if kind == "video":
-        record_argv = engine.build_video_pipeline(capture_node, video_fmt, sink)
-        warmup_argv = (
-            engine.build_video_pipeline(capture_node, video_fmt, "fakesink")
-            if warmup_s > 0
-            else None
-        )
+        record_argv = engine.build_video_pipeline(capture_node, video_fmt, sink, cap=cap)
+        warmup_argv = _warmup_pipeline(capture_node, video_fmt, warmup_s)
     elif kind == "audio":
-        record_argv = engine.build_audio_pipeline(audio_address, audio_fmt, sink)
+        record_argv = engine.build_audio_pipeline(audio_address, audio_fmt, sink, cap=cap)
         warmup_argv = None
     else:  # av
         record_argv = engine.build_av_pipeline(
-            capture_node, video_fmt, audio_address, audio_fmt, sink
+            capture_node, video_fmt, audio_address, audio_fmt, sink, cap=cap
         )
-        warmup_argv = (
-            engine.build_video_pipeline(capture_node, video_fmt, "fakesink")
-            if warmup_s > 0
-            else None
-        )
+        warmup_argv = _warmup_pipeline(capture_node, video_fmt, warmup_s)
     return record_argv, warmup_argv
+
+
+def _preview_pipeline(
+    *,
+    kind: str,
+    capture_node: str | None,
+    planned_video: engine.VideoFormat | None,
+    audio_address: str | None,
+    planned_audio: engine.AudioFormat | None,
+    sink: str,
+    cap: engine.Capability,
+) -> list[str] | None:
+    """The dry-run's pipeline preview, or ``None`` when the plan is still partial.
+
+    The non-running twin of :func:`_build_pipelines`: same builders, same
+    ``cap``, but only the record phase and only when every format the chosen
+    *kind* needs is actually known. A plan missing one of them is reported as
+    ``null`` rather than guessed at, so a partial request never previews a
+    pipeline ``--apply`` would not run.
+    """
+    if kind == "video" and planned_video is not None:
+        argv = engine.build_video_pipeline(capture_node, planned_video, sink, cap=cap)
+    elif kind == "audio" and planned_audio is not None:
+        argv = engine.build_audio_pipeline(audio_address, planned_audio, sink, cap=cap)
+    elif kind == "av" and planned_video is not None and planned_audio is not None:
+        argv = engine.build_av_pipeline(
+            capture_node, planned_video, audio_address, planned_audio, sink, cap=cap
+        )
+    else:
+        return None
+    # Show the same behavioural flags --apply would pass, so the preview is a
+    # promise about the run rather than an approximation of it. The one thing
+    # it deliberately does not copy is _pin_executable's absolute binary path:
+    # which gst-launch-1.0 gets resolved is an environment fact, not part of
+    # the pipeline being previewed.
+    return _with_eos_on_shutdown(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -882,19 +971,23 @@ def _build_pipelines(
 # ---------------------------------------------------------------------------
 
 
-def _dry_run(
+def _plan_formats(
     *,
     device: LogicalDevice,
     kind: str,
     capture_node: str | None,
-    audio_address: str | None,
     requested_video: engine.VideoFormat | None,
     requested_audio: engine.AudioFormat | None,
-    bound: Bound,
-    warmup: float | None,
-    output_path: str,
     probe: bool,
-) -> dict[str, object]:
+) -> tuple[engine.VideoFormat | None, bool, engine.AudioFormat | None]:
+    """The formats a dry-run *plans* to use — :func:`_negotiate_apply_formats`'s twin.
+
+    Video is only enumerated for real under ``--probe``, which opens the camera
+    and is logged; without it the request is carried through as-is and a
+    partial one stays ``None`` so the caller reports the plan as incomplete.
+    Audio needs no device to plan — its default is a constant. Returns
+    ``(planned_video, video_probed, planned_audio)``.
+    """
     planned_video: engine.VideoFormat | None = None
     video_probed = False
     if kind in ("video", "av"):
@@ -910,19 +1003,49 @@ def _dry_run(
         planned_audio = requested_audio or engine.AudioFormat(
             rate=_DEFAULT_AUDIO_RATE, channels=_DEFAULT_AUDIO_CHANNELS
         )
+    return planned_video, video_probed, planned_audio
 
-    sink = f"filesink location={shlex.quote(output_path)}"
-    pipeline_preview: list[str] | None = None
-    if kind == "video" and planned_video is not None:
-        pipeline_preview = engine.build_video_pipeline(capture_node, planned_video, sink)
-    elif kind == "audio" and planned_audio is not None:
-        pipeline_preview = engine.build_audio_pipeline(audio_address, planned_audio, sink)
-    elif kind == "av" and planned_video is not None and planned_audio is not None:
-        pipeline_preview = engine.build_av_pipeline(
-            capture_node, planned_video, audio_address, planned_audio, sink
-        )
 
+def _dry_run(
+    *,
+    device: LogicalDevice,
+    kind: str,
+    capture_node: str | None,
+    audio_address: str | None,
+    requested_video: engine.VideoFormat | None,
+    requested_audio: engine.AudioFormat | None,
+    bound: Bound,
+    warmup: float | None,
+    output_path: str,
+    probe: bool,
+) -> dict[str, object]:
+    planned_video, video_probed, planned_audio = _plan_formats(
+        device=device,
+        kind=kind,
+        capture_node=capture_node,
+        requested_video=requested_video,
+        requested_audio=requested_audio,
+        probe=probe,
+    )
+
+    # Detected *before* the preview is built, not after, so the preview is
+    # checked against the same host facts --apply would use: a plan that names
+    # an encoder this host does not have is a typed error at dry-run time
+    # rather than a surprise at capture time. detect() probes with
+    # `gst-inspect-1.0 --exists`, which opens no device, so this stays inside
+    # the "a no-flag dry-run opens nothing" guarantee.
     cap = engine.detect()
+
+    pipeline_preview = _preview_pipeline(
+        kind=kind,
+        capture_node=capture_node,
+        planned_video=planned_video,
+        audio_address=audio_address,
+        planned_audio=planned_audio,
+        sink=f"filesink location={shlex.quote(output_path)}",
+        cap=cap,
+    )
+
     warmup_s = _resolve_warmup(warmup, kind, planned_video)
 
     return {
@@ -1029,14 +1152,22 @@ def _run_record_phases(
     output_path: str,
     warmup_s: float,
     bound: Bound,
-    gst_launch: str | None,
+    cap: engine.Capability,
 ) -> _RecordRun:
     """Build the pipeline(s), run the warm-up phase (if any), then the bounded recording."""
     sink = f"filesink location={shlex.quote(output_path)}"
     record_argv, warmup_argv = _build_pipelines(
-        kind, capture_node, negotiated_video, audio_address, negotiated_audio, sink, warmup_s
+        kind,
+        capture_node,
+        negotiated_video,
+        audio_address,
+        negotiated_audio,
+        sink,
+        warmup_s,
+        cap=cap,
     )
-    record_argv = _pin_executable(record_argv, gst_launch)
+    gst_launch = cap.gst_launch
+    record_argv = _with_eos_on_shutdown(_pin_executable(record_argv, gst_launch))
     if warmup_argv is not None:
         warmup_argv = _pin_executable(warmup_argv, gst_launch)
 
@@ -1125,7 +1256,7 @@ def _apply_body(
         output_path=output_path,
         warmup_s=warmup_s,
         bound=bound,
-        gst_launch=cap.gst_launch,
+        cap=cap,
     )
 
     size = _require_artifact(

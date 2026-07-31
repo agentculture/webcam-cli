@@ -385,7 +385,7 @@ one file. Dry-run by default.
 
     webcam record <device> <output-path>                  # plan only
     webcam record <device> clip.mkv --apply               # actually record
-    webcam record <device> mic.mkv --kind audio --apply
+    webcam record <device> mic.mka --kind audio --apply
     webcam record <device> both.mkv --kind av --duration 5 --apply
 
 ## What each invocation touches
@@ -419,13 +419,43 @@ sink — and the file is verified to exist and be non-empty before success is
 reported. A pipeline that dies silently is a typed environment error, not a
 phantom success. Warm-up frames go to `fakesink` and are written nowhere.
 
+## Output container
+
+Always **Matroska**, whatever you name the file — `.mkv` for video and av,
+`.mka` for audio-only, by convention rather than by enforcement. The clip is a
+container, not a bare byte stream, so it carries its own geometry, frame rate
+and sample rate and a consumer never has to be told them out of band.
+
+The codec follows the *negotiated source format* rather than a fixed house
+choice:
+
+- **video, MJPG negotiated** — carried through as Motion JPEG. Passthrough: the
+  camera's own hardware JPEG, no re-encode and no quality loss.
+- **video, a raw pixel format (YUYV and friends)** — encoded to VP8. H.264 is
+  not offered because `x264enc` is absent on the reference host and this tool
+  probes for elements rather than assuming them.
+- **audio** — encoded to Opus. Opus constrains the request: `--rate` must be
+  one of 8000, 12000, 16000, 24000 or 48000 Hz and `--channels` at most 8.
+  Anything else is a typed user error naming the set, never a silent resample
+  to a rate you did not ask for and the payload does not report.
+- **`--kind av`** — both branches muxed into one Matroska file **as the device
+  delivers them**, with no per-branch re-encode. An encoded A/V variant would
+  need per-branch pipeline support this surface does not expose; use
+  `webcam stream video --encode` / `webcam stream audio --encode` for an
+  encoded single medium.
+
+Every element this needs is capability-gated like the rest of the engine: a
+missing encoder or muxer is a typed environment error naming the package to
+install, never a silent fallback to some other format.
+
 ## Format
 
 `--pixel-format/--width/--height/--fps` must be given together or not at all
 (video/av); `--rate/--channels` likewise for audio (defaults 48000 Hz, 1
 channel). An unsupported combination is a typed user error naming the
 alternatives, never a silent fallback. Video flags with `--kind audio` (and vice
-versa) are refused rather than ignored.
+versa) are refused rather than ignored. `--kind audio` is additionally
+constrained by the Opus encoder it is stored with — see **Output container**.
 
 ## Warm-up
 

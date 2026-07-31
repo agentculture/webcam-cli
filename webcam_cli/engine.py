@@ -19,7 +19,18 @@ so they are trivially unit-testable and never touch a device. They return an
 argv list, never a shell string, because the project runs subprocesses
 without a shell. Capability detection (:func:`detect`, :func:`require_engine`)
 and format probing (:func:`probe_formats`) are the only functions here that
-shell out.
+shell out. The builders stay pure even while enforcing "the elements I am
+about to emit must exist on this host": they take an already-detected
+:class:`Capability` as a keyword argument rather than detecting one
+themselves (see :func:`require_container_elements`).
+
+Every builder emits a **contained** stream by default: a Matroska container
+is the last element before the caller's sink, so the artifact carries its own
+geometry, pixel format, sample rate and frame rate. Before issue #5 the two
+single-medium builders linked source caps straight to the sink, which shipped
+headerless byte streams that a consumer could not decode without the original
+command line. ``mux=False`` opts out, and exists for the two callers that
+genuinely must not have a container appended — see the builders' docstrings.
 """
 
 from __future__ import annotations
@@ -39,9 +50,24 @@ GST_LAUNCH = "gst-launch-1.0"
 GST_INSPECT = "gst-inspect-1.0"
 GST_DEVICE_MONITOR = "gst-device-monitor-1.0"
 
-# Core elements gate Capability.available: without gst-launch-1.0 itself plus
-# a v4l2 source, an alsa source, and a muxer, none of the three pipeline
-# shapes this module builds (video / audio / muxed A-V) can run at all.
+# Core elements gate Capability.available: gst-launch-1.0 itself, the two
+# capture sources this module knows how to open, and the container every
+# pipeline shape it builds now terminates in.
+#
+# ``matroskamux``'s membership is now literally true of all three shapes —
+# video, audio and muxed A-V each end in it (see the pipeline builders). It
+# was *not* true when this list was written: the two single-medium builders
+# linked source caps straight to the caller's sink and emitted headerless
+# byte streams (issue #5), so the comment that used to sit here justified
+# matroskamux with a claim only ``build_av_pipeline`` honoured. Fixing the
+# builders made the claim true rather than aspirational.
+#
+# ``v4l2src``/``alsasrc`` are a *weaker* claim and always were: an audio-only
+# capture never instantiates v4l2src, and a video-only capture never
+# instantiates alsasrc. They are core because a host missing either can only
+# do half of what this tool advertises, and saying so up front beats
+# discovering it at the first failing capture — not because every shape needs
+# both.
 _CORE_ELEMENTS: tuple[str, ...] = ("v4l2src", "alsasrc", "matroskamux")
 
 # Optional elements: surfaced in Capability.plugins so a caller can branch on
@@ -49,11 +75,22 @@ _CORE_ELEMENTS: tuple[str, ...] = ("v4l2src", "alsasrc", "matroskamux")
 # the menu here and VP8+Opus-in-Matroska/WebM is the viable encoded path —
 # see the module docstring in tests/test_engine.py and the build brief).
 # Missing optional elements never make Capability.available False.
+#
+# The per-shape container elements (``jpegparse``, ``videoconvert``/``vp8enc``,
+# ``audioconvert``/``opusenc``) live here on purpose: each is required only by
+# the shape that emits it. A host that only ever captures MJPG needs
+# jpegparse and matroskamux and genuinely does not need vp8enc or opusenc, so
+# making them core would refuse a capture that host can perform perfectly
+# well. They are instead required *conditionally*, at the moment a builder
+# decides to emit them — see :func:`require_container_elements`.
 _OPTIONAL_ELEMENTS: tuple[str, ...] = (
     "pulsesrc",
+    "jpegparse",
     "jpegenc",
+    "videoconvert",
     "vp8enc",
     "theoraenc",
+    "audioconvert",
     "opusenc",
     "wavenc",
     "lamemp3enc",
@@ -123,10 +160,22 @@ def warmup_seconds(frames: int, fps: float) -> float:
 # the same posture applies to capability/format probing.
 _PROBE_TIMEOUT_S = 10
 
+# Debian/Ubuntu package names for the two GStreamer plugin sets this module's
+# pipeline elements are spread across. They are constants rather than inline
+# literals because each one is the answer for *several* different elements
+# (see _ELEMENT_PACKAGES) as well as for the blanket install hint below, and a
+# package name that drifts between those answers sends a caller a shell command
+# that does not fix their host. ``gstreamer1.0-tools`` and
+# ``gstreamer1.0-plugins-bad`` stay inline: neither carries an element this
+# module emits, so they are named only in the blanket hint and have nothing to
+# drift against.
+GST_PLUGINS_GOOD_PACKAGE = "gstreamer1.0-plugins-good"
+GST_PLUGINS_BASE_PACKAGE = "gstreamer1.0-plugins-base"
+
 _INSTALL_HINT = (
     "install GStreamer with the tools plus good/base plugin sets, e.g. "
-    "'sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good "
-    "gstreamer1.0-plugins-base gstreamer1.0-plugins-bad'"
+    f"'sudo apt install gstreamer1.0-tools {GST_PLUGINS_GOOD_PACKAGE} "
+    f"{GST_PLUGINS_BASE_PACKAGE} gstreamer1.0-plugins-bad'"
 )
 
 # GStreamer raw-video format tokens differ from the V4L2/v4l2-ctl fourcc
@@ -692,6 +741,190 @@ def validate_negotiation(
     )
 
 
+# --- container tails -------------------------------------------------------------
+#
+# Every pipeline this module builds ends in a Matroska container, so the
+# artifact describes itself: geometry, pixel format, frame rate and sample
+# rate travel *inside* the file instead of only in the `--json` payload of the
+# command that produced it. Which elements get us there depends on what the
+# source hands over, and the three routes are deliberately different:
+#
+# * **MJPG video** -> ``jpegparse ! matroskamux``. The camera already did the
+#   compression in hardware; jpegparse only frames the byte stream into
+#   per-picture buffers matroskamux can index. Nothing is decoded and nothing
+#   is re-encoded, so this route is bit-exact on the pixel data and costs
+#   almost no CPU. Re-encoding a hardware JPEG to VP8 would be a pointless
+#   generation loss.
+# * **raw video** (YUYV and friends) -> ``videoconvert ! vp8enc ! matroskamux``.
+#   Matroska *can* carry raw YUY2, but at 640x480x15fps that is 9 MB/s of
+#   undecodable-in-practice bulk; VP8 is the encoded path this project already
+#   settled on (x264enc is absent on the reference host, so H.264 is not on
+#   the menu). ``videoconvert`` bridges the source's pixel layout to one
+#   vp8enc accepts.
+# * **audio** -> ``audioconvert ! opusenc ! matroskamux``. Opus is the audio
+#   half of the same settled VP8+Opus-in-Matroska decision.
+#
+# None of these elements is core (see _OPTIONAL_ELEMENTS): each is needed only
+# by the route that emits it. require_container_elements() is what turns
+# "this route needs vp8enc" into a typed, hinted exit-2 error instead of a
+# silent degradation to some other codec or back to a headerless stream.
+
+#: ``deadline=1`` puts vp8enc in realtime mode. This is not a micro-
+#: optimisation: the source is a live camera whose frames arrive on a wall
+#: clock and cannot be re-fetched, so an encoder slower than the sensor makes
+#: the pipeline shed frames rather than take longer. Measured on the reference
+#: host (C270, 640x480@15, 30 frames): 0.48 s CPU at the default deadline
+#: versus 0.09 s at ``deadline=1``. ``webcam stream`` already used the same
+#: setting for the same reason.
+_VP8ENC_STAGE: tuple[str, ...] = ("vp8enc", "deadline=1")
+
+#: Sample rates ``opusenc`` accepts, read off its own sink-pad caps on the
+#: reference host (GStreamer 1.24.2). A request outside this set could only be
+#: honoured by inserting ``audioresample``, which would record at a *different*
+#: rate than the one the caller asked for and than the ``--json`` payload
+#: reports — the silent substitution Q6 forbids. An unsupported rate is
+#: therefore a typed user error naming the set, never a quiet resample.
+OPUS_SAMPLE_RATES: tuple[int, ...] = (8000, 12000, 16000, 24000, 48000)
+
+#: Channel ceiling for Opus *inside Matroska*: matroskamux's ``audio/x-opus``
+#: sink caps stop at 8, below opusenc's own limit of 255. The container is the
+#: binding constraint, so it is the one reported.
+OPUS_MAX_CHANNELS = 8
+
+CONTAINER_ELEMENT = "matroskamux"
+
+
+def video_container_elements(fmt: VideoFormat) -> tuple[str, ...]:
+    """Every element :func:`build_video_pipeline` emits after the source caps.
+
+    Public so a caller can check host support for a *planned* format before
+    committing to it, and so the capability requirement and the argv can never
+    disagree — both are derived from this one function.
+
+    Only the *source-specific* stages vary: MJPG arrives already compressed by
+    the camera's hardware encoder and needs framing into per-picture buffers,
+    nothing more, while a raw format has to be encoded first. The container is
+    appended once, here, rather than repeated in each branch — it is the one
+    element every video route ends in, and writing it once is what makes that
+    an invariant of this function instead of a coincidence between its returns.
+    """
+    if fmt.pixel_format == "MJPG":
+        source_stages: tuple[str, ...] = ("jpegparse",)
+    else:
+        source_stages = ("videoconvert", _VP8ENC_STAGE[0])
+    return (*source_stages, CONTAINER_ELEMENT)
+
+
+def audio_container_elements() -> tuple[str, ...]:
+    """Every element :func:`build_audio_pipeline` emits after the source caps.
+
+    Unlike the video routes there is no passthrough case: ALSA hands over raw
+    PCM whatever the device, so audio always encodes before it is contained.
+    """
+    return ("audioconvert", "opusenc", CONTAINER_ELEMENT)
+
+
+#: Which Debian/Ubuntu package ships each element the container stages emit.
+#: Module-level because it is pure constant data — rebuilding it per call bought
+#: nothing — and because keeping it beside CONTAINER_ELEMENT and the two
+#: *_container_elements() functions makes the three views of the same element
+#: set (what we emit, what it costs to install, what the argv says) reviewable
+#: side by side. An element absent from this map falls back to _INSTALL_HINT
+#: rather than naming a package we are not sure about.
+_ELEMENT_PACKAGES = {
+    "jpegparse": GST_PLUGINS_GOOD_PACKAGE,
+    "videoconvert": GST_PLUGINS_BASE_PACKAGE,
+    "vp8enc": GST_PLUGINS_GOOD_PACKAGE,
+    "audioconvert": GST_PLUGINS_BASE_PACKAGE,
+    "opusenc": GST_PLUGINS_BASE_PACKAGE,
+    CONTAINER_ELEMENT: GST_PLUGINS_GOOD_PACKAGE,
+}
+
+
+def _container_hint(missing: Sequence[str]) -> str:
+    """An install hint naming the Debian/Ubuntu package each missing element ships in."""
+    needed = sorted(
+        {_ELEMENT_PACKAGES[element] for element in missing if element in _ELEMENT_PACKAGES}
+    )
+    if not needed:
+        return _INSTALL_HINT
+    return (
+        f"install {' and '.join(needed)} — this capture cannot be written to a "
+        "container without it, and this tool will not fall back to an "
+        "undecodable headerless stream or silently pick a different codec"
+    )
+
+
+def require_container_elements(elements: Sequence[str], cap: Capability | None) -> None:
+    """Raise a typed exit-2 error if ``cap`` says this host lacks any of ``elements``.
+
+    ``cap=None`` means "no host information available" and skips the check —
+    that is the *construction-only* mode the pure unit tests and the dry-run
+    preview of an already-validated plan use, not a licence to guess. Callers
+    that are about to actually run the pipeline pass the
+    :class:`Capability` they already detected.
+
+    Never degrades: a missing element is an error naming the element and the
+    package that carries it. There is deliberately no "well, try the next best
+    codec" path (settled design decision Q6), because a caller who asked for
+    MJPG-in-Matroska and silently got VP8 — or, worse, the headerless raw
+    stream this replaced — has been lied to about what it recorded.
+    """
+    if cap is None:
+        return
+    missing = [element for element in elements if not cap.plugins.get(element, False)]
+    if not missing:
+        return
+    raise CliError(
+        EXIT_ENV_ERROR,
+        f"required GStreamer element(s) missing for this capture: {', '.join(missing)}",
+        remediation=_container_hint(missing),
+    )
+
+
+def _require_opus_compatible(fmt: AudioFormat) -> None:
+    """Reject an audio format Opus-in-Matroska cannot carry, before building anything."""
+    if fmt.rate not in OPUS_SAMPLE_RATES:
+        supported = ", ".join(str(rate) for rate in OPUS_SAMPLE_RATES)
+        raise CliError(
+            EXIT_USER_ERROR,
+            f"sample rate {fmt.rate} Hz cannot be encoded as Opus for the Matroska container",
+            remediation=(
+                f"pass one of the rates Opus supports: {supported} (48000 is the default). "
+                "this tool will not resample for you — that would record at a different "
+                "rate than the one you asked for"
+            ),
+        )
+    if fmt.channels > OPUS_MAX_CHANNELS:
+        raise CliError(
+            EXIT_USER_ERROR,
+            f"{fmt.channels} channels exceeds the {OPUS_MAX_CHANNELS} that Opus-in-Matroska "
+            "can carry",
+            remediation=f"pass --channels between 1 and {OPUS_MAX_CHANNELS}",
+        )
+
+
+def _video_container_stages(fmt: VideoFormat) -> list[tuple[str, ...]]:
+    """The container tail for ``fmt`` as one token group per element."""
+    if fmt.pixel_format == "MJPG":
+        return [("jpegparse",), (CONTAINER_ELEMENT,)]
+    return [("videoconvert",), _VP8ENC_STAGE, (CONTAINER_ELEMENT,)]
+
+
+def _audio_container_stages() -> list[tuple[str, ...]]:
+    return [("audioconvert",), ("opusenc",), (CONTAINER_ELEMENT,)]
+
+
+def _tail_tokens(stages: Sequence[Sequence[str]], sink: str) -> list[str]:
+    """Interleave ``!`` between the container stages and the caller's sink."""
+    tokens: list[str] = []
+    for stage in stages:
+        tokens.extend(stage)
+        tokens.append("!")
+    tokens.extend(_sink_tokens(sink))
+    return tokens
+
+
 # --- pipeline construction ------------------------------------------------------
 
 
@@ -760,9 +993,43 @@ def _audio_caps_string(fmt: AudioFormat) -> str:
     return f"audio/x-raw,rate={fmt.rate},channels={fmt.channels}"
 
 
-def build_video_pipeline(node_path: str, fmt: VideoFormat, sink: str) -> list[str]:
-    """Build a ``gst-launch-1.0`` argv for a single video (``v4l2src``) stream."""
+def build_video_pipeline(
+    node_path: str,
+    fmt: VideoFormat,
+    sink: str,
+    *,
+    mux: bool = True,
+    cap: Capability | None = None,
+) -> list[str]:
+    """Build a ``gst-launch-1.0`` argv for a single video (``v4l2src``) stream.
+
+    The stream is containerized by default: MJPG is framed with ``jpegparse``
+    and stored losslessly, anything raw is encoded with ``vp8enc``, and either
+    way the last element before ``sink`` is ``matroskamux`` — see the
+    "container tails" section above for why each route is what it is.
+
+    Args:
+        mux: ``False`` appends nothing between the source caps and ``sink``,
+            handing the whole downstream chain to the caller. Exactly two
+            callers want this and both have a real reason: ``webcam stream``
+            passes its own ``… ! matroskamux streamable=true ! tcpserversink``
+            chain as ``sink`` (a second container here would nest one inside
+            the other), and ``webcam record``'s warm-up phase sinks to
+            ``fakesink`` to burn auto-exposure frames it then throws away —
+            encoding those to VP8 would spend real CPU on pixels nothing ever
+            reads. It is not an escape hatch for "the encoder is missing".
+        cap: Already-detected host capability. When given, the elements this
+            call is about to emit are checked against it and a missing one is
+            a typed exit-2 error (:func:`require_container_elements`); when
+            ``None``, construction proceeds unchecked — the pure mode tests
+            and on-paper previews use. Never triggers detection itself, so
+            this function still shells out to nothing.
+    """
     _validate_video_format(fmt)
+    stages: list[tuple[str, ...]] = []
+    if mux:
+        require_container_elements(video_container_elements(fmt), cap)
+        stages = _video_container_stages(fmt)
     return [
         GST_LAUNCH,
         "v4l2src",
@@ -770,20 +1037,39 @@ def build_video_pipeline(node_path: str, fmt: VideoFormat, sink: str) -> list[st
         "!",
         _video_caps_string(fmt),
         "!",
-        *_sink_tokens(sink),
+        *_tail_tokens(stages, sink),
     ]
 
 
-def build_audio_pipeline(alsa_address: str, fmt: AudioFormat, sink: str) -> list[str]:
+def build_audio_pipeline(
+    alsa_address: str,
+    fmt: AudioFormat,
+    sink: str,
+    *,
+    mux: bool = True,
+    cap: Capability | None = None,
+) -> list[str]:
     """Build a ``gst-launch-1.0`` argv for a single audio (``alsasrc``) stream.
 
     ``alsa_address`` must be a direct ALSA ``hw:`` address (e.g.
     ``hw:CARD=C270,DEV=0``) — see ``arecord -l``. PulseAudio addressing is
     out of scope: on the reference host the target device's PipeWire profile
     is off, so direct ALSA is the only path that works.
+
+    Containerized by default (``audioconvert ! opusenc ! matroskamux``), so
+    the artifact records its own sample rate instead of being a headerless
+    PCM blob. ``mux`` and ``cap`` mean exactly what they do on
+    :func:`build_video_pipeline`; with ``mux=True`` the requested rate and
+    channel count must additionally be ones Opus-in-Matroska can carry, which
+    is a typed user error rather than a silent resample.
     """
     _validate_alsa_address(alsa_address)
     _validate_audio_format(fmt)
+    stages: list[tuple[str, ...]] = []
+    if mux:
+        _require_opus_compatible(fmt)
+        require_container_elements(audio_container_elements(), cap)
+        stages = _audio_container_stages()
     return [
         GST_LAUNCH,
         "alsasrc",
@@ -791,7 +1077,7 @@ def build_audio_pipeline(alsa_address: str, fmt: AudioFormat, sink: str) -> list
         "!",
         _audio_caps_string(fmt),
         "!",
-        *_sink_tokens(sink),
+        *_tail_tokens(stages, sink),
     ]
 
 
@@ -801,6 +1087,8 @@ def build_av_pipeline(
     alsa_address: str,
     afmt: AudioFormat,
     sink: str,
+    *,
+    cap: Capability | None = None,
 ) -> list[str]:
     """Build a ``gst-launch-1.0`` argv muxing video + audio into one sink.
 
@@ -809,10 +1097,20 @@ def build_av_pipeline(
     ``matroskamux name=mux`` is declared once, feeding ``sink``. Order is
     sources-then-muxer, which is the conventional and most portable spelling
     of this idiom, but is not order-sensitive to ``gst_parse_launch``.
+
+    Unlike the single-medium builders this shape has **no per-branch codec
+    tail**: matroskamux accepts ``image/jpeg`` and raw ``video/x-raw`` and
+    ``audio/x-raw`` on its request pads directly, so both branches are stored
+    as the device delivers them. That is the shape that has always worked and
+    it is left alone deliberately — an encoded A-V variant needs per-branch
+    pipeline support the ``stream``/``record`` surfaces do not currently
+    expose. There is no ``mux`` parameter here because a muxer is the whole
+    point of this builder: without it there is no single sink to feed.
     """
     _validate_video_format(fmt)
     _validate_audio_format(afmt)
     _validate_alsa_address(alsa_address)
+    require_container_elements((CONTAINER_ELEMENT,), cap)
     return [
         GST_LAUNCH,
         "v4l2src",

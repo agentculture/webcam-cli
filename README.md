@@ -35,7 +35,7 @@ The console command is `webcam`. The import package is `webcam_cli` and the PyPI
 | `list` | Attached capture devices, video and audio, keyed by **stable id**, reporting the ephemeral node alongside it, collapsing multi-node devices into one logical entry, with per-subsystem access status. |
 | `stream video\|audio\|av <device>` | Serve a live attachment point another process can consume (GStreamer `tcpserversink` on loopback, Matroska-contained). **Unbounded by construction** — no `--duration`. |
 | `stream overview` | Describe the `stream` verb group. |
-| `record <device> <path>` | Record a clip, an audio file, or both muxed, to exactly one file. **Bounded by construction** — a duration cap always applies and no flag means "forever". |
+| `record <device> <path>` | Record a clip, an audio file, or both muxed, to exactly one **Matroska** file. **Bounded by construction** — a duration cap always applies and no flag means "forever". |
 | `whoami` | Report this agent's nick, version, backend, and model from `culture.yaml`. |
 | `learn` | Print a structured self-teaching prompt. |
 | `explain <path>` | Markdown docs for any noun/verb path. |
@@ -44,6 +44,14 @@ The console command is `webcam`. The import package is `webcam_cli` and the PyPI
 | `cli overview` | Describe the CLI surface itself. |
 
 Every command supports `--json`. Results go to stdout, errors/diagnostics to stderr (never mixed). Exit codes: `0` success, `1` user error, `2` environment error (not retryable), `3` device busy (retryable), `4+` reserved.
+
+## What comes out
+
+Every capture path produces **Matroska** — the container, not a bare byte stream — so an artifact carries its own geometry, frame rate, and sample rate and a consumer never has to be told them out of band. `record` picks the codec from the negotiated source format: an MJPG camera format is carried through as Motion JPEG (passthrough, no re-encode, no quality loss), a raw pixel format such as YUYV is encoded to VP8, audio is encoded to Opus, and `--kind av` muxes both branches into one file as the device delivers them. `stream` serves the same container over `tcpserversink`, with `--encode` choosing between the device's own format and VP8/Opus on the wire.
+
+Storing audio as Opus constrains the request: `--rate` must be one of 8000, 12000, 16000, 24000, or 48000 Hz and `--channels` at most 8. Anything else is a typed user error naming the set — this tool will not resample you to a rate you did not ask for. A missing encoder or muxer is likewise a typed environment error naming the package to install, never a silent fallback to another format.
+
+Up to and including `webcam_cli` 0.8.0 this was not true of `record --kind video` and `record --kind audio`, which wrote headerless raw bytes under whatever filename you gave them ([issue #5](https://github.com/agentculture/webcam-cli/issues/5)). Clips captured with 0.8.0 or earlier are raw, and for raw pixel formats are undecodable without the invoking command line.
 
 ## What switches the camera on
 

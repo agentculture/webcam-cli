@@ -815,16 +815,25 @@ def _sink_chain(ctx: _Context, fmt: engine.VideoFormat | None) -> str:
 
 
 def _pipeline(ctx: _Context, fmt: engine.VideoFormat | None) -> list[str] | None:
-    """Build the ``gst-launch-1.0`` argv, or ``None`` if the format is unknown."""
+    """Build the ``gst-launch-1.0`` argv, or ``None`` if the format is unknown.
+
+    The single-medium builders are called with ``mux=False`` because
+    :func:`_sink_chain` has already put a ``matroskamux streamable=true`` in
+    the ``sink`` argument. Letting the engine append its own container too
+    would nest one Matroska inside another. ``stream`` needs to own that
+    element anyway: ``streamable=true`` (a seekless header, required when the
+    sink is a socket rather than a file) and the ``--encode`` routing are both
+    stream-specific, and the engine's file-oriented tail supplies neither.
+    """
     if ctx.medium in ("video", "av") and fmt is None:
         return None
     sink = _sink_chain(ctx, fmt)
     if ctx.medium == "video":
         assert ctx.node is not None and fmt is not None
-        return engine.build_video_pipeline(ctx.node, fmt, sink)
+        return engine.build_video_pipeline(ctx.node, fmt, sink, mux=False)
     if ctx.medium == "audio":
         assert ctx.alsa is not None
-        return engine.build_audio_pipeline(ctx.alsa, _audio_format(ctx), sink)
+        return engine.build_audio_pipeline(ctx.alsa, _audio_format(ctx), sink, mux=False)
     assert ctx.node is not None and ctx.alsa is not None and fmt is not None
     return engine.build_av_pipeline(ctx.node, fmt, ctx.alsa, _audio_format(ctx), sink)
 
