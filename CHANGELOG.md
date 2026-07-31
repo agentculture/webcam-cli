@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-07-31
+
+### Added
+
+- Capability gating for the new container elements: a route whose encoder or parser is missing raises a typed exit-2 naming the element and its Debian package, instead of silently degrading. An MJPG-only host is not refused for lacking a VP8 encoder.
+- Opus constraint on `record --kind audio`: `--rate` must be one Opus carries (8000/12000/16000/24000/48000 Hz) and `--channels` at most 8 — the ceiling comes from matroskamux's `audio/x-opus` sink caps, not from opusenc. Raised as a typed exit-1 rather than resampling, which would record at a rate other than the one requested and reported.
+
+### Changed
+
+- BREAKING for consumers of 0.8.0 artifacts: `record --kind video`/`--kind audio` output is now a container, not a raw stream. Anything parsing 0.8.0's headerless output must be updated. Treat any artifact captured with 0.8.0 or earlier as a raw byte stream regardless of its extension.
+- Codec is chosen from the negotiated source format: MJPG is framed with `jpegparse` and carried through as Motion JPEG (passthrough, no re-encode, no generation loss), raw pixel formats go through `videoconvert ! vp8enc deadline=1`, and audio through `audioconvert ! opusenc`. `--kind av` keeps no per-branch codec tail.
+- `build_video_pipeline`/`build_audio_pipeline` mux by default; `mux=False` opts out for the two callers that supply their own tail (`stream`'s sink chain, and `record`'s warm-up pre-roll, which must not spend CPU encoding frames it discards).
+
+### Fixed
+
+- `record --kind video` and `record --kind audio` wrote headerless raw byte streams with no container at all (issue #5). A file named `.mkv` held concatenated JPEG, or — for raw pixel formats — undecodable YUY2 with nothing recording its geometry. Both now write real Matroska. `record --kind av` and all three `stream` sub-verbs were never affected and are byte-identical.
+- `record` now stops its pipeline with `gst-launch-1.0 -e`, so the muxer finalizes its Segment header on SIGINT. Without it a VP8 recording misreported its own duration (measured: 63 frames declaring 0.731 s instead of 4.267 s). No samples were ever lost; the container was describing itself wrongly.
+
 ## [0.8.0] - 2026-07-24
 
 ### Added

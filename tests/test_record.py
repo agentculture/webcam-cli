@@ -114,7 +114,13 @@ def _ok_report(path: str, kind: str) -> access.AccessReport:
 
 
 def _capability(available: bool = True) -> engine.Capability:
-    plugins = {name: True for name in ("v4l2src", "alsasrc", "matroskamux", "fakesink")}
+    # Derived from the engine's own element list rather than hand-listed, so
+    # adding a required element (as the issue-#5 container tails did:
+    # jpegparse, videoconvert, vp8enc, audioconvert, opusenc) cannot leave
+    # this fake silently claiming a host that could not actually run the
+    # pipelines under test.
+    plugins = {name: True for name in engine._ALL_ELEMENTS}
+    plugins["fakesink"] = True
     return engine.Capability(
         gst_launch="/usr/bin/gst-launch-1.0",
         gst_inspect="/usr/bin/gst-inspect-1.0",
@@ -1119,6 +1125,64 @@ class TestApply:
         )
         assert len(calls) == 1
         assert payload["timestamps"]["warmup_started_at"] is None
+
+    def test_apply_muxes_the_recording_into_a_container(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Issue #5: the recorded artifact must be contained, not a headerless stream."""
+        output = tmp_path / "clip.mkv"
+        calls = self._apply_env(monkeypatch, output)
+        _out(["record", "C270", str(output), "--apply", "--warmup", "1.5", "--json"], capsys)
+
+        record_argv = calls[1]
+        assert record_argv[-4] == "matroskamux"
+        assert record_argv[-3] == "!"
+        assert record_argv[-2] == "filesink"
+        assert record_argv[-1].startswith("location=")
+        # The negotiated default here is MJPG, so it is parsed, never re-encoded.
+        assert "jpegparse" in record_argv
+        assert "vp8enc" not in record_argv
+
+    def test_apply_warmup_phase_skips_the_container_tail(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Warm-up frames are discarded; encoding and muxing them buys nothing."""
+        output = tmp_path / "clip.mkv"
+        calls = self._apply_env(monkeypatch, output)
+        _out(["record", "C270", str(output), "--apply", "--warmup", "1.5", "--json"], capsys)
+
+        warmup_argv = calls[0]
+        assert warmup_argv[-1] == "fakesink"
+        for element in ("matroskamux", "vp8enc", "jpegparse", "opusenc"):
+            assert element not in warmup_argv
+
+    def test_apply_forces_eos_on_shutdown_so_the_container_finalizes(
+        self,
+        env,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Every recording stops on SIGINT, so the muxer needs gst-launch-1.0's -e.
+
+        Without it the VP8 route writes a nonsense Duration into the Matroska
+        header (measured: 0.73 s for a 63-frame clip) — a container that still
+        misreports itself. Warm-up has no container and does not get the flag.
+        """
+        output = tmp_path / "clip.mkv"
+        calls = self._apply_env(monkeypatch, output)
+        _out(["record", "C270", str(output), "--apply", "--warmup", "1.5", "--json"], capsys)
+
+        assert calls[1][1] == "-e"
+        assert "-e" not in calls[0]
 
     def test_apply_pins_resolved_gst_launch_executable(
         self,

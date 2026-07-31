@@ -672,6 +672,76 @@ def test_validate_negotiation_empty_available_raises_user_error():
     assert exc_info.value.code == EXIT_USER_ERROR
 
 
+# --- container tails ----------------------------------------------------------
+#
+# Issue #5: the two single-medium builders used to link source caps straight
+# to the caller's sink, so `record --kind video` wrote concatenated JPEGs or
+# raw YUY2 and `record --kind audio` wrote headerless PCM — files that lie
+# about themselves whatever extension they are given, and that (for raw)
+# cannot be decoded at all without the original command line. Every builder
+# now ends in a Matroska container. The tests below pin *which* elements get
+# there, because the route differs by source: MJPG must stay the camera's own
+# hardware JPEG (parse, never re-encode), raw must be encoded rather than
+# stored as multi-megabyte-per-second bulk, and audio must be Opus.
+
+
+def _capability(missing: frozenset[str] = frozenset()) -> engine.Capability:
+    """A fake Capability reporting every probed element present except ``missing``."""
+    plugins = {name: name not in missing for name in engine._ALL_ELEMENTS}
+    return engine.Capability(
+        gst_launch="/usr/bin/gst-launch-1.0",
+        gst_inspect="/usr/bin/gst-inspect-1.0",
+        plugins=plugins,
+        available=True,
+    )
+
+
+def test_container_elements_are_probed_by_detect():
+    """Route on what detect() reports — so everything a builder can emit must be probed."""
+    emitted = set(engine.audio_container_elements())
+    emitted |= set(engine.video_container_elements(_MJPG_720P))
+    emitted |= set(engine.video_container_elements(_YUYV_VGA))
+
+    assert emitted <= set(engine._ALL_ELEMENTS)
+
+
+def test_per_shape_container_elements_are_not_core():
+    """An MJPG-only host must not be refused for lacking vp8enc/opusenc.
+
+    Each container element is required by exactly the route that emits it, so
+    none of them belongs in the set that gates ``Capability.available``. Only
+    ``matroskamux`` — which all three shapes now really do end in — is core.
+    """
+    assert engine.CONTAINER_ELEMENT in engine._CORE_ELEMENTS
+    for element in ("jpegparse", "videoconvert", "vp8enc", "audioconvert", "opusenc"):
+        assert element not in engine._CORE_ELEMENTS
+        assert element in engine._OPTIONAL_ELEMENTS
+
+
+def test_detect_reports_the_container_elements(monkeypatch):
+    monkeypatch.setattr(engine.shutil, "which", _which_both_present)
+    monkeypatch.setattr(engine.subprocess, "run", _make_inspect_run(missing={"vp8enc"}))
+
+    cap = engine.detect()
+
+    assert cap.plugins["jpegparse"] is True
+    assert cap.plugins["videoconvert"] is True
+    assert cap.plugins["audioconvert"] is True
+    assert cap.plugins["opusenc"] is True
+    assert cap.plugins["vp8enc"] is False
+    # A host without vp8enc can still capture MJPG, so it stays "available".
+    assert cap.available is True
+
+
+def test_video_container_elements_route_on_pixel_format():
+    assert engine.video_container_elements(_MJPG_720P) == ("jpegparse", "matroskamux")
+    assert engine.video_container_elements(_YUYV_VGA) == ("videoconvert", "vp8enc", "matroskamux")
+
+
+def test_audio_container_elements_are_opus_in_matroska():
+    assert engine.audio_container_elements() == ("audioconvert", "opusenc", "matroskamux")
+
+
 # --- build_video_pipeline() ---------------------------------------------------
 
 
@@ -679,29 +749,77 @@ def test_build_video_pipeline_mjpg_shape():
     argv = engine.build_video_pipeline(
         "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_200901010001-video-index0",
         _MJPG_720P,
-        "filesink location=/tmp/out.mjpeg",
+        "filesink location=/tmp/out.mkv",
     )
 
-    assert argv[0] == "gst-launch-1.0"
-    assert argv[1] == "v4l2src"
-    assert "device=/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_200901010001-video-index0" in argv
-    assert "!" in argv
+    assert argv == [
+        "gst-launch-1.0",
+        "v4l2src",
+        "device=/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_200901010001-video-index0",
+        "!",
+        "image/jpeg,width=1280,height=720,framerate=30/1",
+        "!",
+        "jpegparse",
+        "!",
+        "matroskamux",
+        "!",
+        "filesink",
+        "location=/tmp/out.mkv",
+    ]
     caps = [tok for tok in argv if tok.startswith("image/jpeg")][0]
-    assert "width=1280" in caps
-    assert "height=720" in caps
-    assert "framerate=30/1" in caps
     assert " " not in caps  # single argv token, no shell-splitting ambiguity
-    assert argv[-2:] == ["filesink", "location=/tmp/out.mjpeg"]
+
+
+def test_build_video_pipeline_mjpg_never_re_encodes():
+    """The camera already compressed these frames in hardware — keep them.
+
+    jpegparse only frames the byte stream into per-picture buffers the muxer
+    can index. A decode/encode round trip would be a generation loss bought
+    for nothing.
+    """
+    argv = engine.build_video_pipeline("/dev/video0", _MJPG_720P, "filesink location=/tmp/o.mkv")
+
+    for encoder in ("vp8enc", "jpegdec", "jpegenc", "videoconvert", "theoraenc"):
+        assert encoder not in argv
+
+
+def test_build_video_pipeline_raw_encodes_to_vp8_in_matroska():
+    argv = engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "filesink location=/tmp/o.mkv")
+
+    assert argv == [
+        "gst-launch-1.0",
+        "v4l2src",
+        "device=/dev/video0",
+        "!",
+        "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1",  # V4L2 YUYV -> GStreamer
+        "!",
+        "videoconvert",
+        "!",
+        "vp8enc",
+        "deadline=1",
+        "!",
+        "matroskamux",
+        "!",
+        "filesink",
+        "location=/tmp/o.mkv",
+    ]
+
+
+@pytest.mark.parametrize("fmt", [_MJPG_720P, _YUYV_VGA])
+def test_build_video_pipeline_always_ends_in_the_container_before_the_sink(fmt):
+    """The defect in one assertion: nothing may sit between the muxer and the sink."""
+    argv = engine.build_video_pipeline("/dev/video0", fmt, "filesink location=/tmp/o.mkv")
+
+    assert argv[-4:] == ["matroskamux", "!", "filesink", "location=/tmp/o.mkv"]
 
 
 def test_build_video_pipeline_raw_format_maps_to_gstreamer_name():
-    argv = engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "autovideosink")
+    argv = engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "filesink location=/tmp/o.mkv")
 
     caps = [tok for tok in argv if tok.startswith("video/x-raw")][0]
     assert "format=YUY2" in caps  # V4L2 YUYV -> GStreamer YUY2
     assert "width=640" in caps
     assert "height=480" in caps
-    assert argv[-1] == "autovideosink"
 
 
 def test_build_video_pipeline_non_integer_fps_uses_fraction():
@@ -723,24 +841,194 @@ def test_build_video_pipeline_rejects_non_positive_dimensions():
         engine.build_video_pipeline("/dev/video0", bad, "fakesink")
 
 
+# --- mux=False: the two callers that own their own downstream chain -----------
+
+
+def test_build_video_pipeline_mux_false_is_the_bare_source_chain():
+    """``webcam stream`` appends its own muxer; ``record``'s warm-up discards frames."""
+    argv = engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "fakesink", mux=False)
+
+    assert argv == [
+        "gst-launch-1.0",
+        "v4l2src",
+        "device=/dev/video0",
+        "!",
+        "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1",
+        "!",
+        "fakesink",
+    ]
+    assert "matroskamux" not in argv
+    assert "vp8enc" not in argv
+
+
+def test_build_video_pipeline_mux_false_does_not_encode_discarded_warmup_frames():
+    """Warm-up burns auto-exposure frames it throws away — encoding them costs CPU for nothing."""
+    argv = engine.build_video_pipeline("/dev/video0", _MJPG_720P, "fakesink", mux=False)
+
+    assert argv[-1] == "fakesink"
+    assert argv[-2] == "!"
+    # The negotiated source caps are still reproduced exactly: the sensor has
+    # to settle at the geometry and rate it is about to record at.
+    assert argv[-3] == "image/jpeg,width=1280,height=720,framerate=30/1"
+
+
+def test_build_video_pipeline_mux_false_skips_the_element_check():
+    """No container elements are emitted, so none can be missing."""
+    cap = _capability(missing=frozenset({"vp8enc", "jpegparse", "matroskamux"}))
+
+    argv = engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "fakesink", mux=False, cap=cap)
+
+    assert argv[-1] == "fakesink"
+
+
+def test_build_audio_pipeline_mux_false_is_the_bare_source_chain():
+    fmt = engine.AudioFormat(rate=48000, channels=1)
+    argv = engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "fakesink", mux=False)
+
+    assert argv == [
+        "gst-launch-1.0",
+        "alsasrc",
+        "device=hw:CARD=C270,DEV=0",
+        "!",
+        "audio/x-raw,rate=48000,channels=1",
+        "!",
+        "fakesink",
+    ]
+
+
+def test_build_audio_pipeline_mux_false_allows_a_non_opus_rate():
+    """A rate Opus cannot carry is only a problem when this builder emits opusenc.
+
+    ``webcam stream --encode passthrough`` muxes raw PCM into Matroska itself,
+    which has no such restriction, so the check must not fire here.
+    """
+    fmt = engine.AudioFormat(rate=44100, channels=2)
+    argv = engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "fakesink", mux=False)
+
+    assert "rate=44100" in argv[4]
+
+
+# --- never a silent fallback (settled decision Q6) -----------------------------
+
+
+def test_build_video_pipeline_missing_vp8enc_raises_rather_than_shipping_raw():
+    """The old behaviour — headerless raw bytes — must never be a fallback."""
+    cap = _capability(missing=frozenset({"vp8enc"}))
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_video_pipeline(
+            "/dev/video0", _YUYV_VGA, "filesink location=/tmp/o.mkv", cap=cap
+        )
+
+    err = exc_info.value
+    assert err.code == EXIT_ENV_ERROR
+    assert "vp8enc" in err.message
+    assert err.remediation
+    assert "gstreamer1.0-plugins-good" in err.remediation
+
+
+def test_build_video_pipeline_missing_jpegparse_raises_rather_than_re_encoding():
+    """Nor may a missing parser silently reroute MJPG through a different codec."""
+    cap = _capability(missing=frozenset({"jpegparse"}))
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_video_pipeline(
+            "/dev/video0", _MJPG_720P, "filesink location=/tmp/o.mkv", cap=cap
+        )
+
+    assert exc_info.value.code == EXIT_ENV_ERROR
+    assert "jpegparse" in exc_info.value.message
+
+
+def test_build_video_pipeline_mjpg_does_not_require_the_raw_route_elements():
+    """An MJPG capture on a host with no VP8 encoder is perfectly buildable."""
+    cap = _capability(missing=frozenset({"vp8enc", "videoconvert", "opusenc", "audioconvert"}))
+
+    argv = engine.build_video_pipeline(
+        "/dev/video0", _MJPG_720P, "filesink location=/tmp/o.mkv", cap=cap
+    )
+
+    assert "jpegparse" in argv
+    assert "matroskamux" in argv
+
+
+def test_build_video_pipeline_raw_does_not_require_jpegparse():
+    cap = _capability(missing=frozenset({"jpegparse"}))
+
+    argv = engine.build_video_pipeline(
+        "/dev/video0", _YUYV_VGA, "filesink location=/tmp/o.mkv", cap=cap
+    )
+
+    assert "vp8enc" in argv
+
+
+def test_build_audio_pipeline_missing_opusenc_raises_rather_than_shipping_pcm():
+    cap = _capability(missing=frozenset({"opusenc"}))
+    fmt = engine.AudioFormat(rate=48000, channels=1)
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_audio_pipeline(
+            "hw:CARD=C270,DEV=0", fmt, "filesink location=/tmp/a.mka", cap=cap
+        )
+
+    err = exc_info.value
+    assert err.code == EXIT_ENV_ERROR
+    assert "opusenc" in err.message
+    assert err.remediation
+
+
+def test_build_pipeline_names_every_missing_element_at_once():
+    cap = _capability(missing=frozenset({"videoconvert", "vp8enc"}))
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "fakesink", cap=cap)
+
+    assert "videoconvert" in exc_info.value.message
+    assert "vp8enc" in exc_info.value.message
+
+
+def test_build_pipeline_without_a_capability_builds_unchecked():
+    """``cap=None`` is construction-only — used by pure unit tests, never to guess."""
+    argv = engine.build_video_pipeline("/dev/video0", _YUYV_VGA, "fakesink", cap=None)
+
+    assert "vp8enc" in argv
+
+
+def test_require_container_elements_passes_when_all_present():
+    engine.require_container_elements(("jpegparse", "matroskamux"), _capability())
+
+
+def test_require_container_elements_is_a_no_op_without_a_capability():
+    engine.require_container_elements(("nonexistent-element",), None)
+
+
 # --- build_audio_pipeline() ---------------------------------------------------
 
 
 def test_build_audio_pipeline_shape():
-    fmt = engine.AudioFormat(rate=44100, channels=2)
-    argv = engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "filesink location=/tmp/a.wav")
+    fmt = engine.AudioFormat(rate=48000, channels=2)
+    argv = engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "filesink location=/tmp/a.mka")
 
-    assert argv[0] == "gst-launch-1.0"
-    assert argv[1] == "alsasrc"
-    assert "device=hw:CARD=C270,DEV=0" in argv
-    caps = [tok for tok in argv if tok.startswith("audio/x-raw")][0]
-    assert "rate=44100" in caps
-    assert "channels=2" in caps
-    assert argv[-2:] == ["filesink", "location=/tmp/a.wav"]
+    assert argv == [
+        "gst-launch-1.0",
+        "alsasrc",
+        "device=hw:CARD=C270,DEV=0",
+        "!",
+        "audio/x-raw,rate=48000,channels=2",
+        "!",
+        "audioconvert",
+        "!",
+        "opusenc",
+        "!",
+        "matroskamux",
+        "!",
+        "filesink",
+        "location=/tmp/a.mka",
+    ]
 
 
 def test_build_audio_pipeline_rejects_non_hw_address():
-    fmt = engine.AudioFormat(rate=44100, channels=2)
+    fmt = engine.AudioFormat(rate=48000, channels=2)
     with pytest.raises(CliError) as exc_info:
         engine.build_audio_pipeline("pulse:default", fmt, "fakesink")
     assert exc_info.value.code == EXIT_USER_ERROR
@@ -748,9 +1036,40 @@ def test_build_audio_pipeline_rejects_non_hw_address():
 
 
 def test_build_audio_pipeline_rejects_non_positive_channels():
-    fmt = engine.AudioFormat(rate=44100, channels=0)
+    fmt = engine.AudioFormat(rate=48000, channels=0)
     with pytest.raises(CliError):
         engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "fakesink")
+
+
+@pytest.mark.parametrize("rate", list(engine.OPUS_SAMPLE_RATES))
+def test_build_audio_pipeline_accepts_every_opus_rate(rate: int):
+    fmt = engine.AudioFormat(rate=rate, channels=1)
+    argv = engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "fakesink")
+    assert f"rate={rate}" in argv[4]
+
+
+def test_build_audio_pipeline_rejects_a_rate_opus_cannot_carry():
+    """Never resample behind the caller's back: the payload would then lie about the rate."""
+    fmt = engine.AudioFormat(rate=44100, channels=1)
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "fakesink")
+
+    err = exc_info.value
+    assert err.code == EXIT_USER_ERROR
+    assert "44100" in err.message
+    assert "48000" in err.remediation
+    assert "audioresample" not in " ".join(engine.audio_container_elements())
+
+
+def test_build_audio_pipeline_rejects_more_channels_than_opus_in_matroska_carries():
+    fmt = engine.AudioFormat(rate=48000, channels=engine.OPUS_MAX_CHANNELS + 1)
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_audio_pipeline("hw:CARD=C270,DEV=0", fmt, "fakesink")
+
+    assert exc_info.value.code == EXIT_USER_ERROR
+    assert str(engine.OPUS_MAX_CHANNELS) in exc_info.value.remediation
 
 
 # --- build_av_pipeline() -------------------------------------------------------
@@ -788,6 +1107,44 @@ def test_build_av_pipeline_rejects_bad_alsa_address():
     with pytest.raises(CliError) as exc_info:
         engine.build_av_pipeline("/dev/video0", _MJPG_720P, "not-an-alsa-address", afmt, "fakesink")
     assert exc_info.value.code == EXIT_USER_ERROR
+
+
+def test_build_av_pipeline_has_no_per_branch_codec_tail():
+    """The A-V shape was already correct and is deliberately left alone.
+
+    matroskamux takes ``image/jpeg``, raw ``video/x-raw`` and raw
+    ``audio/x-raw`` on its request pads directly, so both branches are stored
+    as the device delivers them. Encoded A-V would need per-branch pipeline
+    support the ``stream``/``record`` surfaces do not expose.
+    """
+    argv = engine.build_av_pipeline(
+        "/dev/video0",
+        _YUYV_VGA,
+        "hw:CARD=C270,DEV=0",
+        engine.AudioFormat(rate=44100, channels=2),
+        "filesink location=/tmp/out.mkv",
+    )
+
+    for element in ("jpegparse", "videoconvert", "vp8enc", "audioconvert", "opusenc"):
+        assert element not in argv
+    assert argv.count("matroskamux") == 1
+
+
+def test_build_av_pipeline_missing_matroskamux_raises():
+    cap = _capability(missing=frozenset({"matroskamux"}))
+
+    with pytest.raises(CliError) as exc_info:
+        engine.build_av_pipeline(
+            "/dev/video0",
+            _MJPG_720P,
+            "hw:CARD=C270,DEV=0",
+            engine.AudioFormat(rate=48000, channels=1),
+            "filesink location=/tmp/out.mkv",
+            cap=cap,
+        )
+
+    assert exc_info.value.code == EXIT_ENV_ERROR
+    assert "matroskamux" in exc_info.value.message
 
 
 def test_build_av_pipeline_argv_never_a_single_shell_string():
