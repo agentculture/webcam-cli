@@ -930,24 +930,64 @@ def _build_pipelines(
     return record_argv, warmup_argv
 
 
+def _preview_pipeline(
+    *,
+    kind: str,
+    capture_node: str | None,
+    planned_video: engine.VideoFormat | None,
+    audio_address: str | None,
+    planned_audio: engine.AudioFormat | None,
+    sink: str,
+    cap: engine.Capability,
+) -> list[str] | None:
+    """The dry-run's pipeline preview, or ``None`` when the plan is still partial.
+
+    The non-running twin of :func:`_build_pipelines`: same builders, same
+    ``cap``, but only the record phase and only when every format the chosen
+    *kind* needs is actually known. A plan missing one of them is reported as
+    ``null`` rather than guessed at, so a partial request never previews a
+    pipeline ``--apply`` would not run.
+    """
+    if kind == "video" and planned_video is not None:
+        argv = engine.build_video_pipeline(capture_node, planned_video, sink, cap=cap)
+    elif kind == "audio" and planned_audio is not None:
+        argv = engine.build_audio_pipeline(audio_address, planned_audio, sink, cap=cap)
+    elif kind == "av" and planned_video is not None and planned_audio is not None:
+        argv = engine.build_av_pipeline(
+            capture_node, planned_video, audio_address, planned_audio, sink, cap=cap
+        )
+    else:
+        return None
+    # Show the same behavioural flags --apply would pass, so the preview is a
+    # promise about the run rather than an approximation of it. The one thing
+    # it deliberately does not copy is _pin_executable's absolute binary path:
+    # which gst-launch-1.0 gets resolved is an environment fact, not part of
+    # the pipeline being previewed.
+    return _with_eos_on_shutdown(argv)
+
+
 # ---------------------------------------------------------------------------
 # dry-run
 # ---------------------------------------------------------------------------
 
 
-def _dry_run(
+def _plan_formats(
     *,
     device: LogicalDevice,
     kind: str,
     capture_node: str | None,
-    audio_address: str | None,
     requested_video: engine.VideoFormat | None,
     requested_audio: engine.AudioFormat | None,
-    bound: Bound,
-    warmup: float | None,
-    output_path: str,
     probe: bool,
-) -> dict[str, object]:
+) -> tuple[engine.VideoFormat | None, bool, engine.AudioFormat | None]:
+    """The formats a dry-run *plans* to use — :func:`_negotiate_apply_formats`'s twin.
+
+    Video is only enumerated for real under ``--probe``, which opens the camera
+    and is logged; without it the request is carried through as-is and a
+    partial one stays ``None`` so the caller reports the plan as incomplete.
+    Audio needs no device to plan — its default is a constant. Returns
+    ``(planned_video, video_probed, planned_audio)``.
+    """
     planned_video: engine.VideoFormat | None = None
     video_probed = False
     if kind in ("video", "av"):
@@ -963,6 +1003,30 @@ def _dry_run(
         planned_audio = requested_audio or engine.AudioFormat(
             rate=_DEFAULT_AUDIO_RATE, channels=_DEFAULT_AUDIO_CHANNELS
         )
+    return planned_video, video_probed, planned_audio
+
+
+def _dry_run(
+    *,
+    device: LogicalDevice,
+    kind: str,
+    capture_node: str | None,
+    audio_address: str | None,
+    requested_video: engine.VideoFormat | None,
+    requested_audio: engine.AudioFormat | None,
+    bound: Bound,
+    warmup: float | None,
+    output_path: str,
+    probe: bool,
+) -> dict[str, object]:
+    planned_video, video_probed, planned_audio = _plan_formats(
+        device=device,
+        kind=kind,
+        capture_node=capture_node,
+        requested_video=requested_video,
+        requested_audio=requested_audio,
+        probe=probe,
+    )
 
     # Detected *before* the preview is built, not after, so the preview is
     # checked against the same host facts --apply would use: a plan that names
@@ -972,23 +1036,15 @@ def _dry_run(
     # the "a no-flag dry-run opens nothing" guarantee.
     cap = engine.detect()
 
-    sink = f"filesink location={shlex.quote(output_path)}"
-    pipeline_preview: list[str] | None = None
-    if kind == "video" and planned_video is not None:
-        pipeline_preview = engine.build_video_pipeline(capture_node, planned_video, sink, cap=cap)
-    elif kind == "audio" and planned_audio is not None:
-        pipeline_preview = engine.build_audio_pipeline(audio_address, planned_audio, sink, cap=cap)
-    elif kind == "av" and planned_video is not None and planned_audio is not None:
-        pipeline_preview = engine.build_av_pipeline(
-            capture_node, planned_video, audio_address, planned_audio, sink, cap=cap
-        )
-    if pipeline_preview is not None:
-        # Show the same behavioural flags --apply would pass, so the preview
-        # is a promise about the run rather than an approximation of it. The
-        # one thing it deliberately does not copy is _pin_executable's
-        # absolute binary path: which gst-launch-1.0 gets resolved is an
-        # environment fact, not part of the pipeline being previewed.
-        pipeline_preview = _with_eos_on_shutdown(pipeline_preview)
+    pipeline_preview = _preview_pipeline(
+        kind=kind,
+        capture_node=capture_node,
+        planned_video=planned_video,
+        audio_address=audio_address,
+        planned_audio=planned_audio,
+        sink=f"filesink location={shlex.quote(output_path)}",
+        cap=cap,
+    )
 
     warmup_s = _resolve_warmup(warmup, kind, planned_video)
 

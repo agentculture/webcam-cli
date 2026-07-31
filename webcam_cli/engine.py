@@ -160,10 +160,22 @@ def warmup_seconds(frames: int, fps: float) -> float:
 # the same posture applies to capability/format probing.
 _PROBE_TIMEOUT_S = 10
 
+# Debian/Ubuntu package names for the two GStreamer plugin sets this module's
+# pipeline elements are spread across. They are constants rather than inline
+# literals because each one is the answer for *several* different elements
+# (see _ELEMENT_PACKAGES) as well as for the blanket install hint below, and a
+# package name that drifts between those answers sends a caller a shell command
+# that does not fix their host. ``gstreamer1.0-tools`` and
+# ``gstreamer1.0-plugins-bad`` stay inline: neither carries an element this
+# module emits, so they are named only in the blanket hint and have nothing to
+# drift against.
+GST_PLUGINS_GOOD_PACKAGE = "gstreamer1.0-plugins-good"
+GST_PLUGINS_BASE_PACKAGE = "gstreamer1.0-plugins-base"
+
 _INSTALL_HINT = (
     "install GStreamer with the tools plus good/base plugin sets, e.g. "
-    "'sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good "
-    "gstreamer1.0-plugins-base gstreamer1.0-plugins-bad'"
+    f"'sudo apt install gstreamer1.0-tools {GST_PLUGINS_GOOD_PACKAGE} "
+    f"{GST_PLUGINS_BASE_PACKAGE} gstreamer1.0-plugins-bad'"
 )
 
 # GStreamer raw-video format tokens differ from the V4L2/v4l2-ctl fourcc
@@ -799,17 +811,28 @@ def audio_container_elements() -> tuple[str, ...]:
     return ("audioconvert", "opusenc", CONTAINER_ELEMENT)
 
 
+#: Which Debian/Ubuntu package ships each element the container stages emit.
+#: Module-level because it is pure constant data — rebuilding it per call bought
+#: nothing — and because keeping it beside CONTAINER_ELEMENT and the two
+#: *_container_elements() functions makes the three views of the same element
+#: set (what we emit, what it costs to install, what the argv says) reviewable
+#: side by side. An element absent from this map falls back to _INSTALL_HINT
+#: rather than naming a package we are not sure about.
+_ELEMENT_PACKAGES = {
+    "jpegparse": GST_PLUGINS_GOOD_PACKAGE,
+    "videoconvert": GST_PLUGINS_BASE_PACKAGE,
+    "vp8enc": GST_PLUGINS_GOOD_PACKAGE,
+    "audioconvert": GST_PLUGINS_BASE_PACKAGE,
+    "opusenc": GST_PLUGINS_BASE_PACKAGE,
+    CONTAINER_ELEMENT: GST_PLUGINS_GOOD_PACKAGE,
+}
+
+
 def _container_hint(missing: Sequence[str]) -> str:
     """An install hint naming the Debian/Ubuntu package each missing element ships in."""
-    packages = {
-        "jpegparse": "gstreamer1.0-plugins-good",
-        "videoconvert": "gstreamer1.0-plugins-base",
-        "vp8enc": "gstreamer1.0-plugins-good",
-        "audioconvert": "gstreamer1.0-plugins-base",
-        "opusenc": "gstreamer1.0-plugins-base",
-        CONTAINER_ELEMENT: "gstreamer1.0-plugins-good",
-    }
-    needed = sorted({packages[element] for element in missing if element in packages})
+    needed = sorted(
+        {_ELEMENT_PACKAGES[element] for element in missing if element in _ELEMENT_PACKAGES}
+    )
     if not needed:
         return _INSTALL_HINT
     return (

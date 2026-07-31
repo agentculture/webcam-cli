@@ -1132,13 +1132,14 @@ def test_build_av_pipeline_has_no_per_branch_codec_tail():
 
 def test_build_av_pipeline_missing_matroskamux_raises():
     cap = _capability(missing=frozenset({"matroskamux"}))
+    afmt = engine.AudioFormat(rate=48000, channels=1)
 
     with pytest.raises(CliError) as exc_info:
         engine.build_av_pipeline(
             "/dev/video0",
             _MJPG_720P,
             "hw:CARD=C270,DEV=0",
-            engine.AudioFormat(rate=48000, channels=1),
+            afmt,
             "filesink location=/tmp/out.mkv",
             cap=cap,
         )
