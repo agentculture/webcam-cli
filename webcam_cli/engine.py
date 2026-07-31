@@ -800,14 +800,27 @@ def video_container_elements(fmt: VideoFormat) -> tuple[str, ...]:
     Public so a caller can check host support for a *planned* format before
     committing to it, and so the capability requirement and the argv can never
     disagree — both are derived from this one function.
+
+    Only the *source-specific* stages vary: MJPG arrives already compressed by
+    the camera's hardware encoder and needs framing into per-picture buffers,
+    nothing more, while a raw format has to be encoded first. The container is
+    appended once, here, rather than repeated in each branch — it is the one
+    element every video route ends in, and writing it once is what makes that
+    an invariant of this function instead of a coincidence between its returns.
     """
     if fmt.pixel_format == "MJPG":
-        return ("jpegparse", CONTAINER_ELEMENT)
-    return ("videoconvert", _VP8ENC_STAGE[0], CONTAINER_ELEMENT)
+        source_stages: tuple[str, ...] = ("jpegparse",)
+    else:
+        source_stages = ("videoconvert", _VP8ENC_STAGE[0])
+    return (*source_stages, CONTAINER_ELEMENT)
 
 
 def audio_container_elements() -> tuple[str, ...]:
-    """Every element :func:`build_audio_pipeline` emits after the source caps."""
+    """Every element :func:`build_audio_pipeline` emits after the source caps.
+
+    Unlike the video routes there is no passthrough case: ALSA hands over raw
+    PCM whatever the device, so audio always encodes before it is contained.
+    """
     return ("audioconvert", "opusenc", CONTAINER_ELEMENT)
 
 
